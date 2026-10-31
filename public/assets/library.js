@@ -17,7 +17,7 @@
 
   function paint(books, prog) {
     if (!books.length) {
-      shelf.innerHTML = '<p class="empty">书架还是空的。把 EPUB 放进 books/ 再跑一次构建脚本就行。</p>';
+      shelf.innerHTML = '<p class="empty">书架还是空的。点右上角「上传书籍」，就能把 EPUB / PDF 放进来。</p>';
       return;
     }
     // 有进度的排前面，其次按加入顺序
