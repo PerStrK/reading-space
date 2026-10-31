@@ -183,7 +183,7 @@ async function handleLogin(request, url, secret, env) {
   }
   const u = String(form.get("u") || "").trim();
   const p = String(form.get("p") || "");
-  const next = safeNext(String(form.get("next") || "/"));
+  const next = safeNext(form.get("next"));
   const ip = await ipKey(request, env);
   const regOpen = (await getAppSetting(env, "register_open")) === "1";
 
@@ -253,8 +253,9 @@ function eq(a, b) {
 }
 
 function safeNext(v) {
-  const s = String(v || "/");
-  if (!s.startsWith("/") || s.startsWith("//")) return "/";
+  const s = String(v || "/library.html");
+  if (!s.startsWith("/") || s.startsWith("//")) return "/library.html";
+  if (s === "/logout") return "/library.html";
   return s;
 }
 
@@ -1003,7 +1004,7 @@ function bookToEntry(b, me) {
     format: b.format,
     chapters: b.chapters || 0,
     pages: b.pages || 0,
-    file: "bookfile/" + b.id,
+    file: "/bookfile/" + b.id + "." + b.format,
     url: (isPdf ? "pdf.html?b=" : "reader.html?b=") + b.id,
     cover: "bookcover/" + b.id,
     size: b.size,
@@ -1023,6 +1024,12 @@ async function mergedBooksJson(request, env, me) {
     if (r.ok) statics = await r.json();
     if (!Array.isArray(statics)) statics = [];
   } catch (e) { /* 静态书目读不到时只给数据库的书 */ }
+  // 静态书的文件路径改成站点绝对路径：阅读器内部的相对路径解析在无扩展名页面下会拼错目录
+  for (const b of statics) {
+    if (b && typeof b.file === "string" && b.file && !b.file.startsWith("/") && !/^https?:/i.test(b.file)) {
+      b.file = "/" + b.file;
+    }
+  }
   const mine = (await visibleBookRows(env, me)).map((b) => bookToEntry(b, me));
   const seen = new Set(statics.map((b) => b.id));
   return json(statics.concat(mine.filter((b) => !seen.has(b.id))));
@@ -1144,7 +1151,8 @@ async function canSeeBook(env, me, id) {
   return !!r;
 }
 
-async function serveBookFile(request, env, me, id, url) {
+async function serveBookFile(request, env, me, rawId, url) {
+  const id = String(rawId || "").replace(/\.(epub|pdf)$/i, "");
   if (!env.DB || !/^[0-9a-f]{16}$/.test(id)) return new Response("not found", { status: 404 });
   const book = await env.DB.prepare("SELECT * FROM books WHERE id = ?").bind(id).first();
   if (!book) return new Response("not found", { status: 404 });
