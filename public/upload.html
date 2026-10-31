@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>上传书籍 · 阅读空间</title>
+<meta name="description" content="阅读空间：上传自己的 EPUB / PDF 到书架。">
+<link rel="stylesheet" href="assets/site.css?v=20261031">
+<script src="/assets/account.js?v=20261031" defer></script>
+<style>
+.top{padding:20px 0 6px}
+.top .wrap{display:flex; align-items:center; gap:12px}
+.brand{display:flex; align-items:center; gap:10px; text-decoration:none; color:inherit; min-width:0}
+.brand .mark{width:34px; height:34px; flex:0 0 auto; border-radius:11px; background:#c2352b; color:#fff;
+  display:grid; place-items:center; font-family:Georgia,"Songti SC",serif; font-size:19px}
+.brand b{font-family:Georgia,"Songti SC",serif; font-size:18px; letter-spacing:.06em; white-space:nowrap}
+.brand .tag{font-size:11.5px; color:var(--muted); letter-spacing:.2em; white-space:nowrap}
+[hidden]{display:none !important}
+.acct{margin-left:auto; font-size:11.5px; font-weight:600; padding:4px 11px; border-radius:999px;
+  background:#e7f2ec; color:#0f6e56; border:1px solid #bfe0d0; white-space:nowrap}
+.out{margin-left:12px; font-size:12.5px; color:var(--muted); text-decoration:none;
+  border-bottom:1px solid #d9cfbd; padding-bottom:1px; white-space:nowrap}
+.out:hover{color:#c2352b; border-color:#c2352b}
+@media (max-width:560px){ .brand .tag{display:none} }
+
+.drop{margin-top:26px; border:1.5px dashed #cfc2a6; border-radius:16px; background:#fffdf9;
+  padding:30px 22px; text-align:center; transition:.15s}
+.drop.over{border-color:#c2352b; background:#fdf3f1}
+.drop p{margin:6px 0; color:var(--muted); font-size:14px}
+.drop .big{font-size:16.5px; color:var(--ink); font-family:Georgia,"Songti SC",serif}
+.btn{display:inline-block; font:inherit; font-size:14.5px; font-weight:600; padding:11px 22px;
+  border:none; border-radius:10px; background:var(--ink); color:#fff; cursor:pointer; margin-top:10px}
+.btn:hover{background:#c2352b}
+.btn:disabled{opacity:.55; cursor:wait}
+.prog{height:8px; background:#eee4cf; border-radius:99px; margin:16px auto 4px; max-width:420px; overflow:hidden; display:none}
+.prog i{display:block; height:100%; width:0; background:#c2352b; transition:width .15s}
+.msg{font-size:13.5px; min-height:22px; margin-top:8px}
+.msg.ok{color:#0f6e56}.msg.err{color:#a3312a}
+h2{font-family:Georgia,"Songti SC",serif; font-size:18px; margin:34px 0 6px}
+table{width:100%; border-collapse:collapse; font-size:13.5px; background:#fffdf9;
+  border:1px solid var(--line); border-radius:12px; overflow:hidden}
+th,td{text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); vertical-align:top}
+th{color:var(--muted); font-weight:600}
+td button{font:inherit; font-size:12.5px; padding:5px 11px; border-radius:8px; border:1px solid var(--line);
+  background:#fff; cursor:pointer}
+td button:hover{border-color:#c2352b; color:#c2352b}
+.dim{color:var(--muted); font-size:12.5px}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="index.html">
+      <span class="mark">阅</span><b>阅读空间</b><span class="tag">上 传 · 书 籍</span>
+    </a>
+    <span class="acct" id="acct" hidden></span>
+    <a class="out" href="/logout">退出</a>
+  </div>
+</header>
+
+<main id="main">
+  <div class="wrap">
+    <div style="font-size:12px;letter-spacing:.22em;color:var(--muted);margin-bottom:10px">UPLOAD</div>
+    <h1>上传书籍</h1>
+    <p class="lead">把 EPUB 或 PDF 放进来，它就会出现在你的书架上。同一本书别人已经传过的话，系统只存一份，你这边直接就有。</p>
+
+    <div class="drop" id="drop">
+      <p class="big">拖文件到这里，或者</p>
+      <button class="btn" id="pick">选择文件</button>
+      <p>支持 .epub / .pdf，单本最大 64MB</p>
+      <input type="file" id="file" accept=".epub,.pdf,application/epub+zip,application/pdf" hidden>
+      <div class="prog" id="prog"><i></i></div>
+      <p class="msg" id="msg"></p>
+    </div>
+
+    <h2>我书架上的上传书籍</h2>
+    <p class="dim" id="mineHint">加载中…</p>
+    <table id="mine" hidden>
+      <tr><th>书名</th><th>格式</th><th>大小</th><th>上传时间</th><th></th></tr>
+    </table>
+    <p style="margin-top:34px"><a href="library.html">← 回书架</a></p>
+  </div>
+</main>
+
+<script>
+(function () {
+  var drop = document.getElementById("drop");
+  var fileInput = document.getElementById("file");
+  var pick = document.getElementById("pick");
+  var prog = document.getElementById("prog");
+  var bar = prog.querySelector("i");
+  var msg = document.getElementById("msg");
+  var table = document.getElementById("mine");
+  var hint = document.getElementById("mineHint");
+  var isAdmin = false;
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+  function say(text, ok) {
+    msg.textContent = text;
+    msg.className = "msg " + (ok ? "ok" : "err");
+  }
+
+  function paint(items) {
+    var rows = items.map(function (b) {
+      var meta = isAdmin && b.uploader ? '<br><span class="dim">首传者 ' + esc(b.uploader) +
+        (b.owners ? " · 在 " + b.owners + " 个书架上" : "") + "</span>" : "";
+      return "<tr><td><b>" + esc(b.title) + "</b>" + meta + "</td>" +
+        "<td>" + esc(String(b.format || "").toUpperCase()) + "</td>" +
+        "<td>" + (b.size / 1048576).toFixed(1) + " MB</td>" +
+        "<td>" + esc(b.added || "") + "</td>" +
+        '<td><button data-remove="' + esc(b.id) + '">从我的书架移除</button></td></tr>';
+    }).join("");
+    if (!items.length) {
+      table.hidden = true;
+      hint.textContent = "还没有上传过书。";
+      return;
+    }
+    hint.textContent = "";
+    table.hidden = false;
+    table.innerHTML = "<tr><th>书名</th><th>格式</th><th>大小</th><th>上传时间</th><th></th></tr>" + rows;
+    table.querySelectorAll("[data-remove]").forEach(function (el) {
+      el.addEventListener("click", function () {
+        if (!confirm("从你的书架移除这本书？如果没有别人也在读，文件会被一并清掉。")) return;
+        fetch("/api/books/remove", {
+          method: "POST", credentials: "same-origin",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id: el.dataset.remove }),
+        }).then(function (r) { return r.json(); })
+          .then(function (j) { if (j.ok) load(); else alert(j.error || "移除失败"); })
+          .catch(function () { alert("移除失败，网络不太顺"); });
+      });
+    });
+  }
+
+  function load() {
+    fetch("/api/books", { credentials: "same-origin" })
+      .then(function (r) { return r.json(); })
+      .then(function (j) { paint(j.items || []); })
+      .catch(function () { hint.textContent = "列表读不出来，刷新试试。"; });
+  }
+
+  fetch("/api/me", { credentials: "same-origin" })
+    .then(function (r) { return r.json(); })
+    .then(function (d) { isAdmin = d && d.role === "admin"; load(); })
+    .catch(load);
+
+  function upload(file) {
+    if (!file) return;
+    if (!/\.(epub|pdf)$/i.test(file.name)) { say("只收 EPUB 和 PDF 文件。", false); return; }
+    if (file.size > 64 * 1024 * 1024) { say("这本超过 64MB 了。", false); return; }
+    var fd = new FormData();
+    fd.append("file", file);
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/books/upload");
+    xhr.withCredentials = true;
+    prog.style.display = "block";
+    pick.disabled = true;
+    say("正在上传 " + file.name + " …", true);
+    xhr.upload.addEventListener("progress", function (e) {
+      if (e.lengthComputable) bar.style.width = Math.round(e.loaded / e.total * 100) + "%";
+    });
+    xhr.addEventListener("load", function () {
+      pick.disabled = false;
+      prog.style.display = "none";
+      bar.style.width = "0";
+      var j = {};
+      try { j = JSON.parse(xhr.responseText); } catch (e) {}
+      if (xhr.status === 200 && j.ok) {
+        say(j.existed ? "这本书站里已经有了，直接加到你的书架啦。" : "上传成功，书已经在你的书架上了。", true);
+        load();
+      } else {
+        say(j.error || ("上传失败（" + xhr.status + "）"), false);
+      }
+    });
+    xhr.addEventListener("error", function () {
+      pick.disabled = false;
+      prog.style.display = "none";
+      say("上传中断，网络不太顺，再试一次。", false);
+    });
+    xhr.send(fd);
+  }
+
+  pick.addEventListener("click", function () { fileInput.click(); });
+  fileInput.addEventListener("change", function () { upload(fileInput.files[0]); fileInput.value = ""; });
+  ["dragenter", "dragover"].forEach(function (ev) {
+    drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.add("over"); });
+  });
+  ["dragleave", "drop"].forEach(function (ev) {
+    drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.remove("over"); });
+  });
+  drop.addEventListener("drop", function (e) {
+    var f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    upload(f);
+  });
+})();
+</script>
+</body>
+</html>

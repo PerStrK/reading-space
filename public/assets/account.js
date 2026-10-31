@@ -18,6 +18,24 @@
       el.textContent = d.label + " · " + d.user;
       el.className = "acct " + (d.role === "admin" ? "acct-admin" : "acct-child");
       el.hidden = false;
+      // 账号标记后面顺手挂两个入口：上传书籍（所有人）、后台管理（仅管理员）
+      try {
+        var nav = document.createElement("span");
+        nav.style.cssText = "margin-left:10px;font-size:12.5px;white-space:nowrap";
+        var up = document.createElement("a");
+        up.href = "/upload.html";
+        up.textContent = "上传书籍";
+        up.style.cssText = "color:inherit;margin-right:12px";
+        nav.appendChild(up);
+        if (d.role === "admin") {
+          var ad = document.createElement("a");
+          ad.href = "/admin";
+          ad.textContent = "后台管理";
+          ad.style.cssText = "color:inherit";
+          nav.appendChild(ad);
+        }
+        el.parentNode.insertBefore(nav, el.nextSibling);
+      } catch (e) {}
     })
     .catch(function () {});
 })();

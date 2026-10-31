@@ -12,6 +12,7 @@ compatibility_date = "2026-01-01"
 [vars]
 READER_USER = "reader"     # 阅读者账号（登录名）
 ADMIN_USER = "admin"       # 管理员账号（留空则没有管理员）
+TEST_USER = "test"         # 试用账号（留空则没有）
 CHILD_NAME = "小朋友"       # 页面上显示的称呼，可改成孩子的名字
 
 # D1 数据库绑定。database_id 用 `wrangler d1 create reading-space` 的输出填

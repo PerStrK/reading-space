@@ -27,14 +27,21 @@ export default {
     const path = url.pathname;
     const accts = accounts(env);
 
-    if (!accts.length) return html(setupHtml(), 200);
+    // 数据库账号：环境变量账号首次运行时播种进 users 表，之后以后台为准
+    await ensureSeed(env, accts);
+    if (!accts.length && !(await anyDbUser(env))) return html(setupHtml(), 200);
 
     const secret = await sessionSecret(env);
-    const open = accts.filter((a) => a.pass);
 
     if (path === "/login") {
-      if (request.method === "POST") return handleLogin(request, url, open, secret, env);
-      return html(loginHtml(safeNext(url.searchParams.get("next")), ""), 200);
+      if (request.method === "POST") return handleLogin(request, url, secret, env);
+      const regOpen = (await getAppSetting(env, "register_open")) === "1";
+      return html(loginHtml(safeNext(url.searchParams.get("next")), "", regOpen), 200);
+    }
+
+    if (path === "/register") {
+      if (request.method === "POST") return handleRegister(request, secret, env);
+      return html(await registerHtml(env, ""), 200);
     }
 
     if (path === "/logout") {
@@ -48,7 +55,7 @@ export default {
       });
     }
 
-    const me = await session(request, open, secret, env);
+    const me = await session(request, secret, env);
     if (!me) {
       return new Response(null, {
         status: 302,
@@ -90,6 +97,34 @@ export default {
       return getSettings(env, me);
     }
 
+    // ---- 上传的书：列表 / 上传 / 从我的书架移除 ----
+    if (path === "/api/books") return listDbBooks(env, me);
+    if (path === "/api/books/upload") {
+      if (request.method !== "POST") return json({ ok: false, error: "POST only" }, 405);
+      return handleUpload(request, env, me);
+    }
+    if (path === "/api/books/remove") {
+      if (request.method !== "POST") return json({ ok: false, error: "POST only" }, 405);
+      return removeMyBook(request, env, me);
+    }
+
+    // ---- 上传书的文件与封面（按账号可见性把关）----
+    if (path.startsWith("/bookfile/")) return serveBookFile(request, env, me, path.slice(10), url);
+    if (path.startsWith("/bookcover/")) return serveBookCover(env, me, path.slice(11));
+
+    // ---- 管理员后台 ----
+    if (path === "/admin") {
+      if (me.role !== "admin") return html(forbiddenHtml(), 403);
+      return html(await adminHtml(env), 200);
+    }
+    if (path.startsWith("/api/admin/")) {
+      if (me.role !== "admin") return json({ ok: false, error: "admin only" }, 403);
+      return adminApi(request, url, env, me, path);
+    }
+
+    // ---- 书架：静态 books.json 与数据库里的书合并（按账号过滤）----
+    if (path === "/books.json") return mergedBooksJson(request, env, me);
+
     return env.ASSETS.fetch(request);
   },
 };
@@ -126,41 +161,46 @@ function ver(env) {
   return String(env.AUTH_VER || "1");
 }
 
-async function handleLogin(request, url, accts, secret, env) {
+async function issueCookie(user, secret, env, location) {
+  const exp = Math.floor(Date.now() / 1000) + TTL;
+  const sig = await sign(secret, `${user}|${exp}|${ver(env)}`);
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location,
+      "set-cookie": `${COOKIE}=${b64url(user)}.${exp}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${TTL}`,
+      "cache-control": "no-store",
+    },
+  });
+}
+
+async function handleLogin(request, url, secret, env) {
   let form;
   try {
     form = await request.formData();
   } catch (e) {
-    return html(loginHtml("/", "提交的内容读不出来，请再试一次。"), 400);
+    return html(loginHtml("/", "提交的内容读不出来，请再试一次。", false), 400);
   }
   const u = String(form.get("u") || "").trim();
   const p = String(form.get("p") || "");
   const next = safeNext(String(form.get("next") || "/"));
   const ip = await ipKey(request, env);
+  const regOpen = (await getAppSetting(env, "register_open")) === "1";
 
   if (await tooManyFails(env, ip)) {
-    return html(loginHtml(next, "尝试次数过多，请 15 分钟后再试。"), 429);
+    return html(loginHtml(next, "尝试次数过多，请 15 分钟后再试。", regOpen), 429);
   }
 
-  const hit = accts.find((a) => eq(u, a.user) && eq(p, a.pass));
+  const hit = await authenticate(env, u, p);
   if (hit) {
     await clearFails(env, ip);
-    const exp = Math.floor(Date.now() / 1000) + TTL;
-    const sig = await sign(secret, `${hit.user}|${exp}|${ver(env)}`);
-    return new Response(null, {
-      status: 302,
-      headers: {
-        location: next,
-        "set-cookie": `${COOKIE}=${b64url(hit.user)}.${exp}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${TTL}`,
-        "cache-control": "no-store",
-      },
-    });
+    return issueCookie(hit.user, secret, env, next);
   }
   await noteFail(env, ip);
-  return html(loginHtml(next, "用户名或密码不对，请再试一次。"), 401);
+  return html(loginHtml(next, "用户名或密码不对，请再试一次。", regOpen), 401);
 }
 
-async function session(request, accts, secret, env) {
+async function session(request, secret, env) {
   const raw = request.headers.get("Cookie") || "";
   const m = raw.match(new RegExp("(?:^|;\\s*)" + COOKIE + "=([^;]+)"));
   if (!m) return null;
@@ -175,11 +215,9 @@ async function session(request, accts, secret, env) {
   } catch (e) {
     return null;
   }
-  const acct = accts.find((a) => a.user === user);
-  if (!acct) return null;
   const want = await sign(secret, `${user}|${exp}|${ver(env)}`);
   if (!eq(sig, want)) return null;
-  return { user: acct.user, role: acct.role, name: acct.name, label: acct.label };
+  return resolveIdentity(env, user);
 }
 
 async function sign(secret, data) {
@@ -257,7 +295,7 @@ async function clearFails(env, ip) {
 
 /* ------------------------------------------------------------ 写入记录 */
 
-function loginHtml(next, err) {
+function loginHtml(next, err, regOpen) {
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · 阅读空间</title>
 <meta name="robots" content="noindex"><style>${LOGIN_CSS}</style></head><body>
@@ -272,6 +310,7 @@ function loginHtml(next, err) {
     <input id="p" name="p" type="password" autocomplete="current-password" required></div>
   <input type="hidden" name="next" value="${next.replace(/"/g, "&quot;")}">
   <button type="submit">进入</button>
+  ${regOpen ? `<p class="foot">没有账号？<a href="/register" style="color:#c2352b">注册一个</a></p>` : ""}
   <p class="foot">家庭自用 · 登录状态保留 7 天</p>
 </form></body></html>`;
 }
@@ -689,4 +728,870 @@ async function exportVocab(url, env, me) {
     });
   }
   return json({ ok: true, user: me.user, count: items.length, items });
+}
+
+
+/* ================================================================
+   账号系统（数据库版）+ 自主注册 + 管理员后台 + 书籍上传
+   ---------------------------------------------------------------
+   - users 表是账号的权威来源；环境变量账号只在首次运行时播种，
+     且同名 DB 账号存在时环境变量不再兜底（保证「删除」真的有效，
+     删除 = disabled 置 1，账号立刻登不进来，管理员可恢复）。
+   - 密码一律 PBKDF2-SHA256 加盐哈希存储，不存明文。
+   - 上传的书按内容 sha256 去重：一本书只存一份（book_chunks），
+     谁上传/重复上传只多一行 user_books。可见性：上传者 + 管理员。
+   ================================================================ */
+
+const PBKDF2_ITERS = 100000;
+const CHUNK_SIZE = 512 * 1024;              // 避开 D1 单值 1MB 上限
+const MAX_UPLOAD = 64 * 1024 * 1024;        // 单本上限 64MB
+const MAX_COVER = 900 * 1024;
+
+function labelFor(role) {
+  return { admin: "管理员", test: "试用", user: "读者", child: "孩子" }[role] || "读者";
+}
+
+function validUsername(u) {
+  return /^[A-Za-z0-9_.\-]{2,24}$/.test(u);
+}
+
+/* ---------- 密码哈希 ---------- */
+
+async function hashPassword(pw) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const bits = await pbkdf2(pw, salt, PBKDF2_ITERS);
+  return "pbkdf2$" + PBKDF2_ITERS + "$" + b64urlBytes(salt) + "$" + b64urlBytes(new Uint8Array(bits));
+}
+
+async function pbkdf2(pw, salt, iters) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveBits"]);
+  return crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: iters, hash: "SHA-256" }, key, 256);
+}
+
+function b64urlToBytes(s) {
+  const pad = s.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(pad + "=".repeat((4 - (pad.length % 4)) % 4));
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
+
+async function verifyPassword(pw, stored) {
+  try {
+    const parts = String(stored || "").split("$");
+    if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
+    const bits = await pbkdf2(pw, b64urlToBytes(parts[2]), Number(parts[1]) || PBKDF2_ITERS);
+    return eq(b64urlBytes(new Uint8Array(bits)), parts[3]);
+  } catch (e) {
+    return false;
+  }
+}
+
+/* ---------- 账号存取 ---------- */
+
+async function getUserRow(env, username) {
+  if (!env.DB) return null;
+  try {
+    return await env.DB.prepare(
+      "SELECT username, pass_hash, role, name, label, disabled, created_at, created_by FROM users WHERE username = ?"
+    ).bind(username).first();
+  } catch (e) {
+    return null;   // users 表还没建（未跑新版 schema）时退化为纯环境变量账号
+  }
+}
+
+async function anyDbUser(env) {
+  if (!env.DB) return false;
+  try {
+    const r = await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first();
+    return !!(r && r.n);
+  } catch (e) {
+    return false;
+  }
+}
+
+async function getAppSetting(env, key) {
+  if (!env.DB) return null;
+  try {
+    const r = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+    return r ? r.value : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function setAppSetting(env, key, value) {
+  if (!env.DB) return;
+  await env.DB.prepare(
+    "INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  ).bind(key, value).run();
+}
+
+/* 环境变量账号播种：只在 users 表为空时跑一次，之后以后台数据为准 */
+let seedDone = false;
+async function ensureSeed(env, accts) {
+  if (seedDone || !env.DB) return;
+  seedDone = true;
+  try {
+    if (await anyDbUser(env)) return;
+    for (const a of accts) {
+      if (!a.pass) continue;
+      const role = a.role === "child" ? "user" : a.role;
+      await env.DB.prepare(
+        "INSERT OR IGNORE INTO users (username, pass_hash, role, name, label, disabled, created_at, created_by) VALUES (?,?,?,?,?,0,?,?)"
+      ).bind(a.user, await hashPassword(a.pass), role, a.name || a.user, a.label || labelFor(role),
+             Date.now(), "env-seed").run();
+    }
+  } catch (e) { /* 表不存在等情况：静默退化为环境变量账号 */ }
+}
+
+/* Cookie 里的用户名 → 身份。DB 账号优先（含禁用判断），其次环境变量账号 */
+async function resolveIdentity(env, username) {
+  const row = await getUserRow(env, username);
+  if (row) {
+    if (row.disabled) return null;
+    return { user: row.username, role: row.role, name: row.name || row.username, label: row.label || labelFor(row.role) };
+  }
+  const acct = accounts(env).find((a) => a.user === username);
+  if (!acct) return null;
+  return { user: acct.user, role: acct.role, name: acct.name, label: acct.label };
+}
+
+/* 登录校验：DB 账号（哈希比对）→ 环境变量账号（明文比对，仅未播种时兜底） */
+async function authenticate(env, u, p) {
+  const row = await getUserRow(env, u);
+  if (row) {
+    if (row.disabled) return null;
+    if (await verifyPassword(p, row.pass_hash)) {
+      return { user: row.username, role: row.role, name: row.name || row.username, label: row.label || labelFor(row.role) };
+    }
+    return null;
+  }
+  const acct = accounts(env).find((a) => a.user === u && a.pass);
+  if (acct && eq(p, acct.pass)) {
+    return { user: acct.user, role: acct.role, name: acct.name, label: acct.label };
+  }
+  return null;
+}
+
+async function usernameTaken(env, u) {
+  if (await getUserRow(env, u)) return true;
+  return accounts(env).some((a) => a.user === u);
+}
+
+async function createUser(env, username, password, role, createdBy, name, label) {
+  await env.DB.prepare(
+    "INSERT INTO users (username, pass_hash, role, name, label, disabled, created_at, created_by) VALUES (?,?,?,?,?,0,?,?)"
+  ).bind(username, await hashPassword(password), role, name || username, label || labelFor(role),
+         Date.now(), createdBy || "").run();
+}
+
+/* ---------- 自主注册 ---------- */
+
+async function registerHtml(env, err) {
+  const open = (await getAppSetting(env, "register_open")) === "1";
+  const body = open
+    ? `<form class="card" method="POST" action="/register">
+    <div class="mark">阅</div>
+    <h1>注册账号</h1>
+    <p class="sub">注册后就能上传自己的书</p>
+    ${err ? `<p class="err">${err}</p>` : ""}
+    <div class="row"><label for="u">用户名</label>
+      <input id="u" name="u" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus
+             placeholder="2-24 位字母、数字或 _ . -"></div>
+    <div class="row"><label for="p">密码</label>
+      <input id="p" name="p" type="password" autocomplete="new-password" required placeholder="至少 6 位"></div>
+    <div class="row"><label for="p2">再输一次密码</label>
+      <input id="p2" name="p2" type="password" autocomplete="new-password" required></div>
+    <button type="submit">注册并进入</button>
+    <p class="foot">已有账号？<a href="/login" style="color:#c2352b">去登录</a></p>
+  </form>`
+    : `<div class="card">
+    <div class="mark">阅</div>
+    <h1>注册未开放</h1>
+    <p class="sub">本站暂时关闭自主注册</p>
+    <p style="font-size:13.5px;color:#4b4335;margin:0">需要账号请联系管理员添加；管理员也可以在后台打开自主注册开关。</p>
+    <p class="foot"><a href="/login" style="color:#c2352b">← 回登录页</a></p>
+  </div>`;
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>注册 · 阅读空间</title>
+<meta name="robots" content="noindex"><style>${LOGIN_CSS}</style></head><body>${body}</body></html>`;
+}
+
+async function handleRegister(request, secret, env) {
+  if ((await getAppSetting(env, "register_open")) !== "1") {
+    return html(await registerHtml(env, ""), 403);
+  }
+  let form;
+  try {
+    form = await request.formData();
+  } catch (e) {
+    return html(await registerHtml(env, "提交的内容读不出来，请再试一次。"), 400);
+  }
+  const u = String(form.get("u") || "").trim();
+  const p = String(form.get("p") || "");
+  const p2 = String(form.get("p2") || "");
+  const ip = await ipKey(request, env);
+  if (await tooManyFails(env, ip)) {
+    return html(await registerHtml(env, "尝试次数过多，请 15 分钟后再试。"), 429);
+  }
+  const fail = async (msg) => {
+    await noteFail(env, ip);
+    return html(await registerHtml(env, msg), 400);
+  };
+  if (!validUsername(u)) return fail("用户名要用 2-24 位字母、数字或 _ . - 组成。");
+  if (p.length < 6) return fail("密码至少 6 位。");
+  if (p !== p2) return fail("两次输入的密码不一致。");
+  if (!env.DB) return fail("本站还没有接数据库，暂时注册不了。");
+  if (await usernameTaken(env, u)) return fail("这个用户名已经被占用了，换一个试试。");
+  try {
+    await createUser(env, u, p, "user", "self-register");
+  } catch (e) {
+    return fail("注册失败，请再试一次。");
+  }
+  await clearFails(env, ip);
+  return issueCookie(u, secret, env, "/");
+}
+
+
+/* ================================================================
+   书籍上传与存储
+   ================================================================ */
+
+function blobBytes(v) {
+  // D1/miniflare 读回的 BLOB 可能是 ArrayBuffer、Uint8Array 或数字数组，统一成 Uint8Array
+  if (!v) return new Uint8Array(0);
+  if (v instanceof Uint8Array) return v;
+  if (v instanceof ArrayBuffer) return new Uint8Array(v);
+  if (Array.isArray(v)) return Uint8Array.from(v);
+  if (typeof v === "object") {
+    const n = Object.keys(v).length;
+    const out = new Uint8Array(n);
+    for (let i = 0; i < n; i++) out[i] = v[i];
+    return out;
+  }
+  return new Uint8Array(0);
+}
+
+async function visibleBookRows(env, me) {
+  if (!env.DB) return [];
+  try {
+    if (me.role === "admin") {
+      const r = await env.DB.prepare(
+        "SELECT b.*, (SELECT COUNT(*) FROM user_books ub WHERE ub.book_id = b.id) AS owners " +
+        "FROM books b ORDER BY b.created_at DESC"
+      ).all();
+      return r.results || [];
+    }
+    const r = await env.DB.prepare(
+      "SELECT b.*, 1 AS owners FROM books b JOIN user_books ub ON ub.book_id = b.id " +
+      "WHERE ub.user = ? ORDER BY ub.added_at DESC"
+    ).bind(me.user).all();
+    return r.results || [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function bookToEntry(b, me) {
+  const isPdf = b.format === "pdf";
+  return {
+    id: b.id,
+    title: b.title || b.id,
+    author: b.author || "",
+    lang: "en",
+    desc: "",
+    level: "",
+    format: b.format,
+    chapters: b.chapters || 0,
+    pages: b.pages || 0,
+    file: "bookfile/" + b.id,
+    url: (isPdf ? "pdf.html?b=" : "reader.html?b=") + b.id,
+    cover: "bookcover/" + b.id,
+    size: b.size,
+    added: b.created_at ? new Date(b.created_at).toISOString().slice(0, 10) : "",
+    uploaded: true,
+    uploader: b.uploader || "",
+    owners: b.owners == null ? undefined : b.owners,
+    mine: !!me && b.uploader === me.user,
+  };
+}
+
+/* 书架数据源：静态 books.json + 当前账号能看到的数据库书籍 */
+async function mergedBooksJson(request, env, me) {
+  let statics = [];
+  try {
+    const r = await env.ASSETS.fetch(new URL("/books.json", request.url));
+    if (r.ok) statics = await r.json();
+    if (!Array.isArray(statics)) statics = [];
+  } catch (e) { /* 静态书目读不到时只给数据库的书 */ }
+  const mine = (await visibleBookRows(env, me)).map((b) => bookToEntry(b, me));
+  const seen = new Set(statics.map((b) => b.id));
+  return json(statics.concat(mine.filter((b) => !seen.has(b.id))));
+}
+
+async function listDbBooks(env, me) {
+  const rows = await visibleBookRows(env, me);
+  return json({ ok: true, items: rows.map((b) => bookToEntry(b, me)) });
+}
+
+async function linkBook(env, user, bookId) {
+  await env.DB.prepare(
+    "INSERT OR IGNORE INTO user_books (user, book_id, added_at) VALUES (?,?,?)"
+  ).bind(user, bookId, Date.now()).run();
+}
+
+/* 没有任何人拥有时，连文件块和封面一起清掉 */
+async function cleanupBookIfOrphan(env, bookId) {
+  const r = await env.DB.prepare("SELECT COUNT(*) AS n FROM user_books WHERE book_id = ?").bind(bookId).first();
+  if (r && r.n === 0) {
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM book_chunks WHERE book_id = ?").bind(bookId),
+      env.DB.prepare("DELETE FROM book_covers WHERE book_id = ?").bind(bookId),
+      env.DB.prepare("DELETE FROM books WHERE id = ?").bind(bookId),
+    ]);
+    return true;
+  }
+  return false;
+}
+
+async function removeMyBook(request, env, me) {
+  let b;
+  try { b = await request.json(); } catch (e) { return json({ ok: false, error: "bad json" }, 400); }
+  const id = String(b.id || "");
+  if (!id) return json({ ok: false, error: "missing id" }, 400);
+  await env.DB.prepare("DELETE FROM user_books WHERE user = ? AND book_id = ?").bind(me.user, id).run();
+  const gone = await cleanupBookIfOrphan(env, id);
+  return json({ ok: true, deleted: gone });
+}
+
+async function handleUpload(request, env, me) {
+  if (!env.DB) return json({ ok: false, error: "本站还没有接数据库，上传不了" }, 501);
+  let form;
+  try {
+    form = await request.formData();
+  } catch (e) {
+    return json({ ok: false, error: "提交的内容读不出来" }, 400);
+  }
+  const file = form.get("file");
+  if (!file || typeof file.arrayBuffer !== "function") {
+    return json({ ok: false, error: "没有收到文件" }, 400);
+  }
+  const name = String(file.name || "book");
+  if (file.size > MAX_UPLOAD) {
+    return json({ ok: false, error: "文件超过 64MB 上限" }, 413);
+  }
+  const buf = new Uint8Array(await file.arrayBuffer());
+  if (buf.length < 4) return json({ ok: false, error: "文件太小，不像一本书" }, 400);
+
+  let format = "";
+  if (buf[0] === 0x50 && buf[1] === 0x4b) format = "epub";                    // PK.. zip
+  else if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) format = "pdf";  // %PDF
+  if (!format || (format === "epub" && !/\.epub$/i.test(name)) || (format === "pdf" && !/\.pdf$/i.test(name))) {
+    return json({ ok: false, error: "只收 EPUB 和 PDF 文件" }, 400);
+  }
+
+  const shaBuf = await crypto.subtle.digest("SHA-256", buf);
+  const sha = Array.from(new Uint8Array(shaBuf)).map((x) => x.toString(16).padStart(2, "0")).join("");
+  const id = sha.slice(0, 16);
+
+  // 去重：内容已在库里，只补一行「我的书架」，文件不重复存
+  const existing = await env.DB.prepare("SELECT * FROM books WHERE sha256 = ?").bind(sha).first();
+  if (existing) {
+    await linkBook(env, me.user, existing.id);
+    return json({ ok: true, existed: true, book: bookToEntry(existing, me) });
+  }
+
+  const fallbackTitle = name.replace(/\.(epub|pdf)$/i, "");
+  let meta = { title: fallbackTitle, author: "", chapters: 0, pages: 0 };
+  let cover = null;
+  try {
+    meta = format === "epub" ? await epubMeta(buf, fallbackTitle) : pdfMeta(buf, fallbackTitle);
+    if (format === "epub") cover = meta.cover || null;
+  } catch (e) { /* 元数据抽不到就用文件名，不挡上传 */ }
+
+  const stmts = [];
+  stmts.push(env.DB.prepare(
+    "INSERT INTO books (id, sha256, title, author, format, size, pages, chapters, has_cover, uploader, created_at) " +
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+  ).bind(id, sha, String(meta.title || fallbackTitle).slice(0, 200), String(meta.author || "").slice(0, 120),
+         format, buf.length, meta.pages || 0, meta.chapters || 0, cover ? 1 : 0, me.user, Date.now()));
+  const nChunks = Math.ceil(buf.length / CHUNK_SIZE);
+  for (let i = 0; i < nChunks; i++) {
+    // 用 slice 拷贝而不是 subarray 视图：D1 对视图的序列化在本地实现里不可靠
+    stmts.push(env.DB.prepare("INSERT INTO book_chunks (book_id, seq, data) VALUES (?,?,?)")
+      .bind(id, i, buf.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE)));
+  }
+  if (cover) {
+    stmts.push(env.DB.prepare("INSERT INTO book_covers (book_id, type, data) VALUES (?,?,?)")
+      .bind(id, cover.type, cover.data));
+  }
+  stmts.push(env.DB.prepare(
+    "INSERT OR IGNORE INTO user_books (user, book_id, added_at) VALUES (?,?,?)"
+  ).bind(me.user, id, Date.now()));
+  await env.DB.batch(stmts);
+
+  const row = await env.DB.prepare("SELECT * FROM books WHERE id = ?").bind(id).first();
+  return json({ ok: true, existed: false, book: bookToEntry(row, me) });
+}
+
+async function canSeeBook(env, me, id) {
+  if (me.role === "admin") {
+    const r = await env.DB.prepare("SELECT id FROM books WHERE id = ?").bind(id).first();
+    return !!r;
+  }
+  const r = await env.DB.prepare(
+    "SELECT book_id FROM user_books WHERE user = ? AND book_id = ?"
+  ).bind(me.user, id).first();
+  return !!r;
+}
+
+async function serveBookFile(request, env, me, id, url) {
+  if (!env.DB || !/^[0-9a-f]{16}$/.test(id)) return new Response("not found", { status: 404 });
+  const book = await env.DB.prepare("SELECT * FROM books WHERE id = ?").bind(id).first();
+  if (!book) return new Response("not found", { status: 404 });
+  if (!(await canSeeBook(env, me, id))) return new Response("forbidden", { status: 403 });
+
+  const total = book.size;
+  const type = book.format === "pdf" ? "application/pdf" : "application/epub+zip";
+  const fname = encodeURIComponent((book.title || id) + "." + book.format);
+  const base = {
+    "content-type": type,
+    "content-disposition": "inline; filename*=UTF-8''" + fname,
+    "accept-ranges": "bytes",
+    "cache-control": "private, max-age=3600",
+  };
+
+  let start = 0, end = total - 1, status = 200;
+  const range = request.headers.get("range");
+  if (range) {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+    if (m) {
+      if (m[1] === "" && m[2] !== "") {           // bytes=-N：最后 N 字节
+        start = Math.max(0, total - Number(m[2]));
+      } else {
+        start = Number(m[1] || 0);
+        end = m[2] === "" ? total - 1 : Math.min(Number(m[2]), total - 1);
+      }
+      if (start > end || start >= total) {
+        return new Response(null, { status: 416, headers: { "content-range": "bytes */" + total } });
+      }
+      status = 206;
+    }
+  }
+
+  const firstChunk = Math.floor(start / CHUNK_SIZE);
+  const lastChunk = Math.floor(end / CHUNK_SIZE);
+  const r = await env.DB.prepare(
+    "SELECT seq, data FROM book_chunks WHERE book_id = ? AND seq >= ? AND seq <= ? ORDER BY seq"
+  ).bind(id, firstChunk, lastChunk).all();
+  const rows = (r.results || []).map((x) => ({ seq: x.seq, bytes: blobBytes(x.data) }));
+  const joined = new Uint8Array(rows.reduce((n, x) => n + x.bytes.byteLength, 0));
+  let off = 0;
+  for (const row of rows) {
+    joined.set(row.bytes, off);
+    off += row.bytes.byteLength;
+  }
+  const slice = joined.subarray(start - firstChunk * CHUNK_SIZE, end - firstChunk * CHUNK_SIZE + 1);
+
+  const headers = { ...base, "content-length": String(slice.byteLength) };
+  if (status === 206) headers["content-range"] = `bytes ${start}-${end}/${total}`;
+  if (request.method === "HEAD") return new Response(null, { status, headers });
+  return new Response(slice, { status, headers });
+}
+
+async function serveBookCover(env, me, id) {
+  if (!env.DB || !/^[0-9a-f]{16}$/.test(id)) return new Response("not found", { status: 404 });
+  const book = await env.DB.prepare("SELECT * FROM books WHERE id = ?").bind(id).first();
+  if (!book) return new Response("not found", { status: 404 });
+  if (!(await canSeeBook(env, me, id))) return new Response("forbidden", { status: 403 });
+  if (book.has_cover) {
+    const c = await env.DB.prepare("SELECT type, data FROM book_covers WHERE book_id = ?").bind(id).first();
+    if (c && c.data) {
+      return new Response(blobBytes(c.data), {
+        headers: { "content-type": c.type || "image/jpeg", "cache-control": "private, max-age=86400" },
+      });
+    }
+  }
+  // 没有抽到封面：现画一张 SVG 占位（纸色底 + 红线 + 书名）
+  const t = String(book.title || "未命名").replace(/[<>&"]/g, "");
+  const short = t.length > 24 ? t.slice(0, 24) + "…" : t;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="640" viewBox="0 0 480 640">` +
+    `<rect width="480" height="640" fill="#f5f0e7"/><rect width="480" height="10" fill="#c2352b"/>` +
+    `<text x="240" y="310" font-size="30" fill="#22262b" text-anchor="middle" font-family="Georgia,serif">${short}</text>` +
+    `<text x="240" y="356" font-size="17" fill="#6b6459" text-anchor="middle">${book.format === "pdf" ? "PDF" : "EPUB"}</text></svg>`;
+  return new Response(svg, {
+    headers: { "content-type": "image/svg+xml; charset=utf-8", "cache-control": "private, max-age=86400" },
+  });
+}
+
+/* ---------- EPUB 元数据：极简 ZIP 读取（只认 OPF 与封面） ---------- */
+
+function u16(b, o) { return b[o] | (b[o + 1] << 8); }
+function u32(b, o) { return (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0; }
+
+function zipEntries(buf) {
+  let eocd = -1;
+  const from = Math.max(0, buf.length - 65557);
+  for (let i = buf.length - 22; i >= from; i--) {
+    if (u32(buf, i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("no eocd");
+  const count = u16(buf, eocd + 10);
+  let off = u32(buf, eocd + 16);
+  const map = new Map();
+  const dec = new TextDecoder();
+  for (let i = 0; i < count; i++) {
+    if (u32(buf, off) !== 0x02014b50) break;
+    const method = u16(buf, off + 10);
+    const compSize = u32(buf, off + 20);
+    const nameLen = u16(buf, off + 28);
+    const extraLen = u16(buf, off + 30);
+    const commentLen = u16(buf, off + 32);
+    const localOff = u32(buf, off + 42);
+    const name = dec.decode(buf.subarray(off + 46, off + 46 + nameLen));
+    map.set(name, { method, compSize, localOff });
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return map;
+}
+
+async function zipRead(buf, entry) {
+  const lo = entry.localOff;
+  if (u32(buf, lo) !== 0x04034b50) throw new Error("bad local header");
+  const nameLen = u16(buf, lo + 26);
+  const extraLen = u16(buf, lo + 28);
+  const start = lo + 30 + nameLen + extraLen;
+  const raw = buf.subarray(start, start + entry.compSize);
+  if (entry.method === 0) return new Uint8Array(raw);
+  if (entry.method === 8) {
+    const ds = new DecompressionStream("deflate-raw");
+    const stream = new Blob([raw]).stream().pipeThrough(ds);
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+  throw new Error("unsupported zip method " + entry.method);
+}
+
+async function epubMeta(buf, fallbackTitle) {
+  const out = { title: fallbackTitle, author: "", chapters: 0, pages: 0, cover: null };
+  const entries = zipEntries(buf);
+  const get = async (name) => {
+    const e = entries.get(name);
+    return e ? zipRead(buf, e) : null;
+  };
+  let opfPath = null;
+  const container = await get("META-INF/container.xml");
+  if (container) {
+    const m = /full-path="([^"]+)"/.exec(new TextDecoder().decode(container));
+    if (m) opfPath = m[1];
+  }
+  if (!opfPath) {
+    for (const name of entries.keys()) {
+      if (name.toLowerCase().endsWith(".opf")) { opfPath = name; break; }
+    }
+  }
+  if (!opfPath) return out;
+  const opfBytes = await get(opfPath);
+  if (!opfBytes) return out;
+  const opf = new TextDecoder().decode(opfBytes);
+  const pick = (re) => {
+    const m = re.exec(opf);
+    return m ? m[1].replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">").replace(/&quot;/g, '"').trim() : "";
+  };
+  out.title = pick(/<dc:title[^>]*>([\s\S]*?)<\/dc:title>/) || fallbackTitle;
+  out.author = pick(/<dc:creator[^>]*>([\s\S]*?)<\/dc:creator>/);
+  out.chapters = (opf.match(/media-type="application\/xhtml\+xml"/g) || []).length;
+
+  // 封面：meta name=cover → item href（与 build_books.py 同一套路，简化版）
+  try {
+    const cm = /<meta[^>]+name="cover"[^>]+content="([^"]+)"/.exec(opf);
+    let href = null;
+    if (cm) {
+      const re1 = new RegExp('<item[^>]+id="' + cm[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + '"[^>]+href="([^"]+)"');
+      const re2 = new RegExp('<item[^>]+href="([^"]+)"[^>]+id="' + cm[1].replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + '"');
+      const hit = re1.exec(opf) || re2.exec(opf);
+      if (hit) href = hit[1];
+    }
+    if (!href) {
+      for (const name of entries.keys()) {
+        if (/cover\.(jpe?g|png)$/i.test(name)) { href = name; break; }
+      }
+    }
+    if (href) {
+      const dir = opfPath.includes("/") ? opfPath.slice(0, opfPath.lastIndexOf("/") + 1) : "";
+      const full = href.startsWith("/") ? href.slice(1) : dir + href;
+      const parts = [];
+      for (const seg of full.split("/")) {
+        if (seg === "..") parts.pop();
+        else if (seg !== ".") parts.push(seg);
+      }
+      const coverEntry = entries.get(parts.join("/")) || entries.get(href);
+      if (coverEntry) {
+        const data = await zipRead(buf, coverEntry);
+        if (data && data.byteLength > 0 && data.byteLength <= MAX_COVER) {
+          out.cover = {
+            type: /\.png$/i.test(href) ? "image/png" : "image/jpeg",
+            data,
+          };
+        }
+      }
+    }
+  } catch (e) { /* 封面抽不到无所谓，占位图兜底 */ }
+  return out;
+}
+
+/* ---------- PDF 元数据：只挖标题与大致页数 ---------- */
+
+function pdfMeta(buf, fallbackTitle) {
+  const out = { title: fallbackTitle, author: "", chapters: 0, pages: 0, cover: null };
+  const tail = new TextDecoder("latin1").decode(buf.subarray(0, Math.min(buf.length, 1 << 20)));
+  const head2 = new TextDecoder("latin1").decode(buf.subarray(Math.max(0, buf.length - (1 << 20))));
+  const scan = tail + head2;
+  const tm = /\/Title\s*\(((?:\\.|[^()\\])*)\)/.exec(scan);
+  if (tm) {
+    out.title = tm[1].replace(/\\([()\\])/g, "$1").trim() || fallbackTitle;
+  } else {
+    const hm = /\/Title\s*<([0-9A-Fa-f\s]+)>/.exec(scan);
+    if (hm) {
+      try {
+        const hex = hm[1].replace(/\s/g, "");
+        const bytes = new Uint8Array(hex.length / 2);
+        for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+        if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+          out.title = new TextDecoder("utf-16be").decode(bytes.subarray(2)).trim() || fallbackTitle;
+        }
+      } catch (e) { /* 解不出就用文件名 */ }
+    }
+  }
+  const whole = new TextDecoder("latin1").decode(buf);
+  out.pages = (whole.match(/\/Type\s*\/Page(?![a-zA-Z])/g) || []).length;
+  out.chapters = out.pages;
+  return out;
+}
+
+
+/* ================================================================
+   管理员后台
+   ================================================================ */
+
+function forbiddenHtml() {
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>没有权限 · 阅读空间</title>
+<meta name="robots" content="noindex"><style>${LOGIN_CSS}</style></head><body>
+<div class="card">
+  <div class="mark">阅</div>
+  <h1>没有权限</h1>
+  <p class="sub">这个页面只有管理员能看</p>
+  <p class="foot"><a href="/" style="color:#c2352b">← 回主页</a></p>
+</div></body></html>`;
+}
+
+async function adminData(env) {
+  const data = { register_open: (await getAppSetting(env, "register_open")) === "1", users: [], books: [] };
+  if (!env.DB) return data;
+  try {
+    const u = await env.DB.prepare(
+      "SELECT username, role, label, disabled, created_at, created_by FROM users ORDER BY created_at"
+    ).all();
+    data.users = u.results || [];
+  } catch (e) {}
+  try {
+    const b = await env.DB.prepare(
+      "SELECT b.id, b.title, b.author, b.format, b.size, b.uploader, b.created_at, " +
+      "(SELECT GROUP_CONCAT(ub.user) FROM user_books ub WHERE ub.book_id = b.id) AS owners " +
+      "FROM books b ORDER BY b.created_at DESC"
+    ).all();
+    data.books = b.results || [];
+  } catch (e) {}
+  return data;
+}
+
+async function adminApi(request, url, env, me, path) {
+  if (!env.DB) return json({ ok: false, error: "no db" }, 501);
+  if (path === "/api/admin/overview") {
+    return json({ ok: true, ...(await adminData(env)) });
+  }
+  let b = {};
+  if (request.method === "POST") {
+    try { b = await request.json(); } catch (e) { return json({ ok: false, error: "bad json" }, 400); }
+  }
+
+  if (path === "/api/admin/users" && request.method === "POST") {
+    const u = String(b.username || "").trim();
+    const p = String(b.password || "");
+    const role = ["user", "test", "admin"].includes(b.role) ? b.role : "user";
+    if (!validUsername(u)) return json({ ok: false, error: "用户名要用 2-24 位字母、数字或 _ . - 组成" }, 400);
+    if (p.length < 4) return json({ ok: false, error: "密码至少 4 位" }, 400);
+    if (await usernameTaken(env, u)) return json({ ok: false, error: "用户名已被占用" }, 400);
+    await createUser(env, u, p, role, me.user);
+    return json({ ok: true });
+  }
+
+  if (path === "/api/admin/users/delete" && request.method === "POST") {
+    const u = String(b.username || "");
+    if (!u) return json({ ok: false, error: "missing username" }, 400);
+    if (u === me.user) return json({ ok: false, error: "不能删除自己" }, 400);
+    await env.DB.prepare("UPDATE users SET disabled = 1 WHERE username = ?").bind(u).run();
+    // 他书架上的书一并摘下；没人拥有的书连文件一起清掉
+    const mine = await env.DB.prepare("SELECT book_id FROM user_books WHERE user = ?").bind(u).all();
+    await env.DB.prepare("DELETE FROM user_books WHERE user = ?").bind(u).run();
+    for (const row of mine.results || []) await cleanupBookIfOrphan(env, row.book_id);
+    return json({ ok: true });
+  }
+
+  if (path === "/api/admin/users/restore" && request.method === "POST") {
+    const u = String(b.username || "");
+    if (!u) return json({ ok: false, error: "missing username" }, 400);
+    await env.DB.prepare("UPDATE users SET disabled = 0 WHERE username = ?").bind(u).run();
+    return json({ ok: true });
+  }
+
+  if (path === "/api/admin/settings" && request.method === "POST") {
+    await setAppSetting(env, "register_open", b.register_open ? "1" : "0");
+    return json({ ok: true, register_open: !!b.register_open });
+  }
+
+  if (path === "/api/admin/books/delete" && request.method === "POST") {
+    const id = String(b.id || "");
+    if (!id) return json({ ok: false, error: "missing id" }, 400);
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM user_books WHERE book_id = ?").bind(id),
+      env.DB.prepare("DELETE FROM book_chunks WHERE book_id = ?").bind(id),
+      env.DB.prepare("DELETE FROM book_covers WHERE book_id = ?").bind(id),
+      env.DB.prepare("DELETE FROM books WHERE id = ?").bind(id),
+    ]);
+    return json({ ok: true });
+  }
+
+  return json({ ok: false, error: "unknown admin api" }, 404);
+}
+
+async function adminHtml(env) {
+  const d = await adminData(env);
+  const esc = (s) => String(s == null ? "" : s).replace(/[<>&"]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" }[c]));
+  const when = (ts) => ts ? new Date(ts).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }) : "";
+  const mb = (n) => (n / 1048576).toFixed(1) + " MB";
+
+  const userRows = d.users.map((u) => `
+    <tr class="${u.disabled ? "off" : ""}">
+      <td><b>${esc(u.username)}</b>${u.disabled ? ' <span class="tag">已删除</span>' : ""}</td>
+      <td>${esc(u.label || labelFor(u.role))}</td>
+      <td>${esc(u.created_by || "")}</td>
+      <td>${when(u.created_at)}</td>
+      <td>${u.disabled
+        ? `<button data-restore="${esc(u.username)}">恢复</button>`
+        : `<button data-del="${esc(u.username)}">删除</button>`}</td>
+    </tr>`).join("");
+
+  const bookRows = d.books.map((b) => `
+    <tr>
+      <td><b>${esc(b.title || b.id)}</b><br><small>${esc(b.author || "")}</small></td>
+      <td>${b.format.toUpperCase()}</td>
+      <td>${mb(b.size)}</td>
+      <td>${esc(b.uploader || "")}</td>
+      <td>${esc(b.owners || "（无人）")}</td>
+      <td>${when(b.created_at)}</td>
+      <td><button data-delbook="${esc(b.id)}">删除</button></td>
+    </tr>`).join("");
+
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>后台管理 · 阅读空间</title>
+<meta name="robots" content="noindex"><style>
+  :root{--paper:#f5f0e7;--ink:#22262b;--muted:#6b6459;--line:#e4d9c5;--red:#c2352b}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);padding:22px 16px 60px;
+    font:15px/1.65 "PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif}
+  .wrap{max-width:920px;margin:0 auto}
+  h1{font-family:Georgia,"Songti SC",serif;font-size:22px;margin:4px 0 2px}
+  h2{font-size:16.5px;margin:30px 0 10px}
+  .sub{color:var(--muted);font-size:13px;margin:0 0 8px}
+  .card{background:#fffdf9;border:1px solid var(--line);border-radius:16px;padding:18px;margin-top:14px}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th,td{text-align:left;padding:8px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600}
+  tr.off td{color:#a39a89;text-decoration:line-through}
+  tr.off td .tag{text-decoration:none}
+  .tag{background:#f3e2df;color:#a3312a;border-radius:6px;padding:1px 7px;font-size:11.5px}
+  button{font:inherit;font-size:13px;padding:6px 13px;border-radius:8px;border:1px solid var(--line);
+    background:#fff;cursor:pointer}
+  button:hover{border-color:var(--red);color:var(--red)}
+  button.primary{background:var(--ink);color:#fff;border-color:var(--ink)}
+  button.primary:hover{background:var(--red);color:#fff}
+  input,select{font:inherit;font-size:14px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .msg{font-size:13px;color:#a3312a;min-height:20px}
+  a{color:var(--red)}
+  .switch{display:flex;gap:10px;align-items:center}
+</style></head><body><div class="wrap">
+  <p class="sub"><a href="/">← 回主页</a> · <a href="/library">书架</a></p>
+  <h1>后台管理</h1>
+  <p class="sub">账号与全站书籍都在这里。删除账号是「停用」：对方立刻登不进来，随时能恢复。</p>
+
+  <div class="card">
+    <h2 style="margin-top:0">自主注册</h2>
+    <div class="switch">
+      <span>访客自主注册：<b id="regState">${d.register_open ? "已开放" : "已关闭"}</b></span>
+      <button id="regToggle">${d.register_open ? "关闭注册" : "开放注册"}</button>
+    </div>
+    <p class="sub" style="margin-top:8px">开放后，任何人打开 /register 都能自助注册账号（角色为读者）。</p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">账号（${d.users.length}）</h2>
+    <table><tr><th>用户名</th><th>身份</th><th>来源</th><th>创建时间</th><th></th></tr>${userRows || '<tr><td colspan="5">还没有数据库账号</td></tr>'}</table>
+    <h2>新增账号</h2>
+    <div class="row">
+      <input id="nu" placeholder="用户名" autocapitalize="none" spellcheck="false">
+      <input id="np" type="text" placeholder="密码（至少 4 位）">
+      <select id="nr"><option value="user">读者</option><option value="test">试用</option><option value="admin">管理员</option></select>
+      <button class="primary" id="addUser">新增</button>
+    </div>
+    <p class="msg" id="umsg"></p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">全部书籍（${d.books.length}）</h2>
+    <table><tr><th>书名</th><th>格式</th><th>大小</th><th>首传者</th><th>在谁的书架上</th><th>上传时间</th><th></th></tr>${bookRows || '<tr><td colspan="7">还没有人上传过书</td></tr>'}</table>
+  </div>
+
+</div>
+<script>
+  async function post(path, body) {
+    const r = await fetch(path, { method: "POST", credentials: "same-origin",
+      headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) });
+    const j = await r.json().catch(() => ({}));
+    if (!j.ok) throw new Error(j.error || ("http " + r.status));
+    return j;
+  }
+  document.getElementById("regToggle").addEventListener("click", async () => {
+    const now = document.getElementById("regState").textContent.includes("已开放");
+    try { await post("/api/admin/settings", { register_open: !now }); location.reload(); }
+    catch (e) { alert(e.message); }
+  });
+  document.getElementById("addUser").addEventListener("click", async () => {
+    const msg = document.getElementById("umsg");
+    try {
+      await post("/api/admin/users", {
+        username: document.getElementById("nu").value.trim(),
+        password: document.getElementById("np").value,
+        role: document.getElementById("nr").value,
+      });
+      location.reload();
+    } catch (e) { msg.textContent = e.message; }
+  });
+  document.querySelectorAll("[data-del]").forEach((el) => el.addEventListener("click", async () => {
+    if (!confirm("删除账号 " + el.dataset.del + "？对方将无法登录（可恢复）。")) return;
+    try { await post("/api/admin/users/delete", { username: el.dataset.del }); location.reload(); }
+    catch (e) { alert(e.message); }
+  }));
+  document.querySelectorAll("[data-restore]").forEach((el) => el.addEventListener("click", async () => {
+    try { await post("/api/admin/users/restore", { username: el.dataset.restore }); location.reload(); }
+    catch (e) { alert(e.message); }
+  }));
+  document.querySelectorAll("[data-delbook]").forEach((el) => el.addEventListener("click", async () => {
+    if (!confirm("删除这本书？所有人的书架上都会消失，文件也会清掉。")) return;
+    try { await post("/api/admin/books/delete", { id: el.dataset.delbook }); location.reload(); }
+    catch (e) { alert(e.message); }
+  }));
+</script>
+</body></html>`;
 }

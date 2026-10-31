@@ -72,3 +72,63 @@ CREATE TABLE IF NOT EXISTS user_settings (
   auto_vocab  INTEGER NOT NULL DEFAULT 0,
   updated_at  INTEGER NOT NULL DEFAULT 0
 );
+
+-- 账号（数据库版）：环境变量账号在首次运行时播种进来，之后以后台为准
+--   pass_hash 格式 pbkdf2$迭代次数$盐$哈希（均为 base64）
+--   disabled=1 表示已被管理员删除：不能登录，且同名环境变量账号也不再兜底
+CREATE TABLE IF NOT EXISTS users (
+  username   TEXT PRIMARY KEY,
+  pass_hash  TEXT NOT NULL,
+  role       TEXT NOT NULL DEFAULT 'user',   -- admin | user | test
+  name       TEXT,                            -- 页面称呼
+  label      TEXT,                            -- 账号角标文案
+  disabled   INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER,
+  created_by TEXT
+);
+
+-- 全站设置（键值）：register_open = '1' 时开放访客自主注册，默认关闭
+CREATE TABLE IF NOT EXISTS app_settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
+
+-- 上传的书：一本书只存一份，按内容 sha256 去重
+CREATE TABLE IF NOT EXISTS books (
+  id         TEXT PRIMARY KEY,          -- sha256 前 16 位，进 URL 和进度表
+  sha256     TEXT NOT NULL UNIQUE,      -- 全量哈希，去重键
+  title      TEXT,
+  author     TEXT,
+  format     TEXT NOT NULL,             -- epub | pdf
+  size       INTEGER NOT NULL,
+  pages      INTEGER,                   -- PDF 页数（估算）
+  chapters   INTEGER,                   -- EPUB 章节数（估算）
+  has_cover  INTEGER NOT NULL DEFAULT 0,
+  uploader   TEXT,                      -- 第一个上传者
+  created_at INTEGER
+);
+
+-- 书的文件内容：512KB 一块（避开 D1 单值 1MB 上限），按 seq 拼回去
+CREATE TABLE IF NOT EXISTS book_chunks (
+  book_id TEXT NOT NULL,
+  seq     INTEGER NOT NULL,
+  data    BLOB NOT NULL,
+  PRIMARY KEY (book_id, seq)
+);
+
+-- 封面原图（从 EPUB 里抽出来的，限 900KB 以内；没有就走占位图）
+CREATE TABLE IF NOT EXISTS book_covers (
+  book_id TEXT PRIMARY KEY,
+  type    TEXT,
+  data    BLOB NOT NULL
+);
+
+-- 谁的书架上有这本书：上传、以及重复上传同一本书时各记一行
+CREATE TABLE IF NOT EXISTS user_books (
+  user     TEXT NOT NULL,
+  book_id  TEXT NOT NULL,
+  added_at INTEGER,
+  PRIMARY KEY (user, book_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_books_book ON user_books(book_id);

@@ -46,6 +46,16 @@
 - Cookie 里只放用户名，角色由服务端查表决定——客户端无法自称管理员
 - 登录失败按 IP 限流
 
+**账号系统（数据库版）**
+- 环境变量账号在首次运行时播种进 `users` 表（密码转 PBKDF2 加盐哈希），之后以后台为准
+- 管理员后台 `/admin`：新增账号、删除（停用，可恢复）、查看全部书籍
+- 访客自主注册 `/register`：默认**关闭**，管理员在后台开关
+
+**书籍上传**
+- 任何账号都能在 `/upload.html` 上传 EPUB / PDF（单本 ≤ 64MB），自动抽元数据与封面
+- 文件按内容 SHA-256 去重后分块存进 D1：同一本书全站只存一份，谁传都只多一行书架记录
+- 可见性：上传的书只有上传者和管理员能看到；`books/` 里的静态书仍是全员可见
+
 ---
 
 ## 技术栈
@@ -309,6 +319,14 @@ python3 tools/split_pdf.py ~/Downloads/某本大书.pdf
 | GET / POST / DELETE | `/api/vocab` | 生词本 |
 | GET | `/api/vocab/export?format=json\|csv\|md` | 导出 |
 | GET / POST | `/api/settings` | 账号偏好（`auto_vocab`） |
+| GET | `/api/books` | 当前账号能看到的数据库书籍（管理员看全部） |
+| POST | `/api/books/upload` | 上传一本书（multipart，字段 `file`） |
+| POST | `/api/books/remove` | 把一本书从自己的书架移除（`{id}`） |
+| GET | `/bookfile/<id>` | 上传书的原文件（支持 Range） |
+| GET | `/bookcover/<id>` | 上传书的封面（无封面时返回占位图） |
+| GET / POST | `/register` | 自主注册（默认关闭，后台开关） |
+| GET | `/admin` | 管理员后台（账号管理 + 全部书籍） |
+| GET / POST | `/api/admin/*` | 后台接口：overview / users / users/delete / users/restore / settings / books/delete |
 
 除 `/login`、`/logout` 外都需要登录 Cookie。
 
