@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>阅读 · 阅读空间</title>
+<style>
+
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%}
+body{font-family:-apple-system,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  background:#f7f4ec; color:#22262b; display:flex; flex-direction:column; overflow:hidden}
+/* 顶部 */
+#top{flex:0 0 auto; display:flex; align-items:center; gap:10px; padding:10px 12px;
+  background:#fffdf9; border-bottom:1px solid #e4d9c5; z-index:30}
+#top .back{display:inline-flex; align-items:center; gap:5px; text-decoration:none; color:#22262b;
+  font-size:13px; background:#f2ece0; border:1px solid #e4d9c5; border-radius:999px; padding:6px 12px; white-space:nowrap}
+#top .back:hover{background:#c2352b; border-color:#c2352b; color:#fff}
+#top .ttl{flex:1; min-width:0; font-size:13.5px; font-weight:600;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:center}
+#top .ico{display:inline-flex; align-items:center; justify-content:center; width:34px; height:34px;
+  border-radius:10px; border:1px solid #e4d9c5; background:#fffdf9; color:#5b5348; cursor:pointer; flex:0 0 auto}
+#top .ico:hover{background:#f2ece0; color:#c2352b}
+#top .ico svg{width:17px; height:17px; fill:none; stroke:currentColor; stroke-width:1.9; stroke-linecap:round; stroke-linejoin:round}
+/* 阅读区 */
+#stage{flex:1 1 auto; position:relative; overflow:hidden; background:#f7f4ec}
+#viewer{position:absolute; inset:0}
+#viewer iframe{border:0}
+#hint{position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); color:#9a917f; font-size:14px}
+/* 底部 */
+#bot{flex:0 0 auto; display:flex; align-items:center; gap:12px; padding:8px 14px 10px;
+  background:#fffdf9; border-top:1px solid #e4d9c5; font-size:12px; color:#6b6459; z-index:30}
+#bot .pbar{flex:1; height:4px; background:#e8e0d2; border-radius:3px; overflow:hidden}
+#bot .pbar i{display:block; height:100%; width:0; background:#c2352b; transition:width .25s}
+#bot b{font-weight:600; color:#22262b}
+#bot button{border:1px solid #e4d9c5; background:#fffdf9; color:#5b5348; border-radius:9px;
+  width:34px; height:30px; cursor:pointer; font-size:15px; line-height:1}
+#bot button:disabled{opacity:.35; cursor:default}
+/* 抽屉 */
+.panel{position:fixed; top:0; right:0; bottom:0; width:min(320px,84vw); background:#fffdf9;
+  border-left:1px solid #e4d9c5; box-shadow:-14px 0 40px rgba(40,30,15,.16); z-index:60;
+  transform:translateX(102%); transition:transform .26s ease; display:flex; flex-direction:column}
+.panel.on{transform:none}
+.panel header{display:flex; align-items:center; justify-content:space-between; padding:14px 16px;
+  border-bottom:1px solid #eee5d4; font-size:14px; font-weight:600}
+.panel header span{cursor:pointer; color:#8a8174; font-weight:400}
+.panel .body{flex:1; overflow:auto; padding:8px 0}
+.panel .row{display:block; width:100%; text-align:left; border:0; background:none; cursor:pointer;
+  padding:10px 16px; font-size:13.5px; line-height:1.55; color:#3a342a; border-bottom:1px solid #f4eee1}
+.panel .row:hover{background:#f7f1e4}
+.panel .row small{display:block; color:#9a917f; font-size:11.5px; margin-top:2px}
+.panel .row.now{background:#fdf3f1; color:#c2352b}
+#mask{position:fixed; inset:0; background:rgba(30,25,15,.35); z-index:55; opacity:0; pointer-events:none; transition:opacity .26s}
+#mask.on{opacity:1; pointer-events:auto}
+/* 划词气泡 */
+#pop{position:absolute; left:50%; bottom:10px; transform:translateX(-50%); z-index:60; display:none;
+  flex-direction:column; background:#22262b; color:#f8f3e9; border-radius:16px; padding:10px 12px 12px;
+  box-shadow:0 12px 34px rgba(0,0,0,.34); font-size:13px; width:min(94%,460px);
+  max-height:64vh; overflow:hidden}
+#pop.on{display:flex}
+#pop .hd{display:flex; align-items:flex-start; gap:8px; flex:0 0 auto}
+#pop .w{flex:1 1 auto; min-width:0; color:#ffd9a8; font-size:12.5px; line-height:1.5;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden}
+#pop .x{flex:0 0 auto; width:26px; height:26px; border-radius:50%; background:rgba(255,255,255,.12);
+  color:#f8f3e9; font-size:16px; line-height:1; display:grid; place-items:center; padding:0; margin:-2px -2px 0 0}
+#pop .x:hover{background:#c2352b}
+#pop .acts{display:flex; gap:6px; margin-top:8px; flex-wrap:wrap; flex:0 0 auto}
+#pop button{border:0; background:rgba(255,255,255,.12); color:#f8f3e9; border-radius:8px;
+  padding:6px 11px; font-size:12.5px; cursor:pointer; white-space:nowrap}
+#pop button:hover{background:#c2352b}
+#pop button.primary{background:#2c7a7b}
+#pop button.primary:hover{background:#1f6162}
+#pop .tr{margin-top:9px; padding-top:9px; border-top:1px solid rgba(255,255,255,.14);
+  line-height:1.62; font-size:12.8px; white-space:pre-wrap; display:none; position:relative;
+  max-height:5.2em; overflow:hidden}
+#pop .tr.on{display:block}
+/* 展开后自己是一块可滚区域：再长的译文也只在气泡里滑动，不会顶出屏幕 */
+#pop .tr.full{max-height:42vh; overflow-y:auto; -webkit-overflow-scrolling:touch; overscroll-behavior:contain;
+  padding-right:4px}
+#pop .tr.full::-webkit-scrollbar{width:6px}
+#pop .tr.full::-webkit-scrollbar-thumb{background:rgba(255,255,255,.28); border-radius:3px}
+#pop .tr.on.clipped::after{content:""; position:absolute; left:0; right:0; bottom:0; height:1.7em;
+  background:linear-gradient(transparent,#22262b 70%); pointer-events:none}
+#pop .tr.wait{color:#9aa3b8}
+/* 单词的音标：和释义区分开，像词典那样 */
+#pop .tr .ipa{color:#93c7c7; font-size:12px; letter-spacing:.35px; margin-right:5px}
+#pop .more{margin-top:6px; display:none; flex:0 0 auto}
+#pop .more.on{display:block}
+#pop .more button{background:rgba(255,255,255,.08); color:#cfd6e6; padding:4px 10px; font-size:12px}
+#pop .more button:hover{background:rgba(255,255,255,.16); color:#fff}
+/* 连续滚动模式：底部翻页键不再有意义 */
+body.scrolled #bot button{opacity:.3; pointer-events:none}
+#toast{position:fixed; left:50%; bottom:76px; transform:translateX(-50%); background:rgba(34,38,43,.92);
+  color:#fff; font-size:13px; padding:9px 16px; border-radius:999px; opacity:0; transition:opacity .2s; z-index:70; pointer-events:none}
+#toast.on{opacity:1}
+body.sepia{background:#f4ecd8} body.sepia #stage{background:#f4ecd8}
+body.night{background:#161a1f} body.night #stage{background:#161a1f}
+body.night #top,body.night #bot{background:#1d2228; border-color:#2b323a; color:#c9d1d9}
+body.night #top .ttl{color:#e6edf3} body.night #top .back,body.night #top .ico,body.night #bot button{background:#242a31; border-color:#333b44; color:#c9d1d9}
+@media (max-width:560px){ #top .ttl{font-size:12.5px} #bot{gap:8px} }
+
+
+/* PDF 专用 */
+#viewer{overflow:auto; -webkit-overflow-scrolling:touch; padding:12px 0 20px}
+#page{position:relative; margin:12px auto; background:#fff; box-shadow:0 8px 26px rgba(40,30,15,.16)}
+#cv{display:block; width:100%; height:100%}
+#hlLayer{position:absolute; inset:0; pointer-events:none; z-index:1}
+#tl{position:absolute; inset:0; overflow:hidden; opacity:1; line-height:1; text-align:initial;
+  text-size-adjust:none; forced-color-adjust:none; transform-origin:0 0; z-index:2}
+#tl span, #tl br{color:transparent; position:absolute; white-space:pre; cursor:text; transform-origin:0% 0%}
+#tl ::selection{background:rgba(255,205,60,.45)}
+#tl .endOfContent{display:block; position:absolute; inset:100% 0 0; z-index:-1; cursor:default; user-select:none}
+#bot .pin{min-width:74px; text-align:center}
+#bot .pbar{min-width:40px}
+#pop{position:fixed; left:50%; bottom:64px; transform:translateX(-50%)}
+.pagejump{display:flex; gap:8px; padding:14px 16px; align-items:center}
+.pagejump input{width:78px; padding:7px 9px; border:1px solid #e4d9c5; border-radius:8px; font-size:14px}
+.pagejump button{padding:7px 14px; border:1px solid #e4d9c5; background:#fffdf9; border-radius:8px; cursor:pointer}
+#bot button{white-space:nowrap}
+
+/* ---- 连续滚动模式 ---- */
+/* 左右翻页时隐藏滚动容器；连续滚动时反过来 */
+body:not(.scrollmode) #flow{display:none}
+body.scrollmode #page{display:none}
+body.scrollmode #viewer{overflow-y:auto; overflow-x:hidden; padding:10px 0 40px}
+body.scrollmode #bot button{opacity:.55}
+/* 每个页容器：高度先占好，画布后画，滚动条长度才不会跳 */
+#flow .pg{position:relative; margin:10px auto; background:#fff; box-shadow:0 6px 20px rgba(40,30,15,.14)}
+#flow .pg canvas{display:block; width:100%; height:100%}
+#flow .pg .hl{position:absolute; inset:0; pointer-events:none; z-index:1}
+#flow .pg .tl{position:absolute; inset:0; overflow:hidden; opacity:1; line-height:1; text-align:initial;
+  text-size-adjust:none; forced-color-adjust:none; transform-origin:0 0; z-index:2}
+#flow .pg .tl span, #flow .pg .tl br{color:transparent; position:absolute; white-space:pre; cursor:text; transform-origin:0% 0%}
+#flow .pg .tl ::selection{background:rgba(255,205,60,.45)}
+#flow .pg .tl .endOfContent{display:block; position:absolute; inset:100% 0 0; z-index:-1; cursor:default; user-select:none}
+/* 页码角标，滚动时一眼知道在哪；放左上角，避开书里自己印的页码 */
+#flow .pg .pn{position:absolute; left:6px; top:5px; z-index:3; font-size:10.5px; color:#b3a893;
+  background:rgba(255,253,249,.82); padding:1px 6px; border-radius:999px; pointer-events:none}
+
+@media (max-width:560px){
+  #bot{gap:6px; padding:6px 8px}
+  #bot button{padding:0 6px; font-size:12.5px; width:auto; height:28px}
+  #bot .pin{min-width:58px; font-size:12px}
+  #bot .pbar{min-width:22px}
+}
+
+</style>
+</head>
+<body>
+
+<div id="top">
+  <a class="back" href="library.html">← 书架</a>
+  <div class="ttl" id="ttl">正在打开…</div>
+  <button class="ico" id="bmBtn" title="加书签"><svg viewBox="0 0 24 24"><path d="M7 4h10v16l-5-4-5 4z"/></svg></button>
+  <button class="ico" id="listBtn" title="书签与设置"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg></button>
+</div>
+
+<div id="stage">
+  <div id="viewer">
+    <div id="page">
+      <canvas id="cv"></canvas>
+      <div id="hlLayer"></div>
+      <div id="tl" class="textLayer"></div>
+    </div>
+    <!-- 连续滚动模式：每一页一个占位容器，滚到附近才真正渲染 -->
+    <div id="flow"></div>
+  </div>
+  <div id="hint">正在打开…</div>
+</div>
+
+<div id="bot">
+  <button id="prevBtn">‹</button>
+  <span class="pin" id="pinfo">– / –</span>
+  <button id="nextBtn">›</button>
+  <div class="pbar"><i id="pbar"></i></div>
+  <button id="jumpBtn" style="width:auto;padding:0 8px">页码</button>
+  <button id="zoomOut" style="width:auto;padding:0 8px">A－</button>
+  <button id="zoomIn" style="width:auto;padding:0 8px">A＋</button>
+  <button id="fitBtn" style="width:auto;padding:0 8px">适宽</button>
+</div>
+
+<div id="pop"></div>
+<div id="toast"></div>
+
+<div class="panel" id="tocPanel">
+  <header>跳到某页<span data-close>关闭</span></header>
+  <div class="body">
+    <div class="pagejump">
+      <input id="pageInput" type="number" min="1" placeholder="页码">
+      <button id="goPage">跳转</button>
+    </div>
+    <div style="padding:4px 16px 10px;font-size:11.5px;line-height:1.6;color:#9a917f">
+      也可以直接按键盘 ← → 翻页。PDF 是固定版式，用右下角 A＋/A－ 或「适宽」调大小。
+    </div>
+  </div>
+</div>
+
+<div class="panel" id="listPanel">
+  <header>书签与设置<span data-close>关闭</span></header>
+  <div class="body">
+    <div style="padding:12px 16px 4px; font-size:12px; color:#9a917f">翻页方式</div>
+    <div style="padding:0 16px; display:flex; gap:8px">
+      <button class="row" id="flowPage" style="flex:1;text-align:center;border:1px solid #e4d9c5;border-radius:9px">左右翻页</button>
+      <button class="row" id="flowScroll" style="flex:1;text-align:center;border:1px solid #e4d9c5;border-radius:9px">连续滚动</button>
+    </div>
+    <div style="padding:6px 16px 12px;font-size:11.5px;color:#a89e8c;line-height:1.5">
+      连续滚动适合一口气往下读；左右翻页更像翻书。
+    </div>
+    <div style="padding:12px 16px 4px; font-size:12px; color:#9a917f">划词入库</div>
+    <div style="padding:0 16px; display:flex; gap:8px">
+      <button class="row" id="vocabManual" style="flex:1;text-align:center;border:1px solid #e4d9c5;border-radius:9px">手动加入</button>
+      <button class="row" id="vocabAuto" style="flex:1;text-align:center;border:1px solid #e4d9c5;border-radius:9px">自动加入</button>
+    </div>
+    <div style="padding:6px 16px 12px;font-size:11.5px;color:#a89e8c;line-height:1.5">
+      自动：点「翻译」就翻译、存进生词本，并把这句高亮；手动：只有点「存生词」才记。
+    </div>
+    <div style="padding:12px 16px 4px; font-size:12px; color:#9a917f">我的书签</div>
+    <div id="bmList"></div>
+  </div>
+</div>
+<div id="mask"></div>
+
+<script type="module">
+  // pdf.min.mjs 是 ESM，用动态 import 挂到 window 上给普通脚本用
+  import * as pdfjs from "./assets/vendor/pdf.min.mjs";
+  window.pdfjsLib = pdfjs;
+  var s = document.createElement("script");
+  s.src = "assets/pdf-reader.js?v=20261031";
+  document.body.appendChild(s);
+</script>
+</body>
+</html>

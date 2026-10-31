@@ -1,0 +1,21 @@
+# 复制成 wrangler.toml 后再改：cp wrangler.toml.example wrangler.toml
+# wrangler.toml 已在 .gitignore 里，不会被提交。
+#
+# ⚠️ 这里的 [vars] 是明文变量。wrangler 每次带着这个文件部署时，
+#    会用文件里的值覆盖线上同名变量（文件里没写的会被删掉）。
+#    所以：账号名可以写在这里，密码一律去 Cloudflare 后台加 Secret，不要写进本文件。
+
+name = "reading-space"
+pages_build_output_dir = "public"
+compatibility_date = "2026-01-01"
+
+[vars]
+READER_USER = "reader"     # 阅读者账号（登录名）
+ADMIN_USER = "admin"       # 管理员账号（留空则没有管理员）
+CHILD_NAME = "小朋友"       # 页面上显示的称呼，可改成孩子的名字
+
+# D1 数据库绑定。database_id 用 `wrangler d1 create reading-space` 的输出填
+[[d1_databases]]
+binding = "DB"
+database_name = "reading-space"
+database_id = "00000000-0000-0000-0000-000000000000"

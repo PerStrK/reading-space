@@ -1,0 +1,17 @@
+{
+  "name": "reading-space",
+  "version": "1.0.0",
+  "private": true,
+  "description": "EPUB / PDF 书架与阅读器，带划词翻译、生词本和云端阅读进度，部署在 Cloudflare Pages",
+  "license": "MIT",
+  "scripts": {
+    "build": "python3 tools/build_books.py && python3 tools/build_reader.py && python3 tools/build_pdf_reader.py",
+    "dev": "wrangler pages dev public",
+    "deploy": "wrangler pages deploy public",
+    "db:init:local": "wrangler d1 execute reading-space --local --file=schema/schema.sql",
+    "db:init:remote": "wrangler d1 execute reading-space --remote --file=schema/schema.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

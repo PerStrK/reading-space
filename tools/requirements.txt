@@ -1,0 +1,7 @@
+# 构建脚本用到的 Python 依赖
+#   pip install -r tools/requirements.txt
+#
+# build_reader.py / build_pdf_reader.py 只用标准库，不需要额外安装。
+
+PyMuPDF>=1.24    # 读 PDF 页尺寸、渲染封面、切分上下册
+Pillow>=10.0     # 生成封面缩略图

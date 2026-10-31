@@ -1,0 +1,34 @@
+# 依赖
+node_modules/
+
+# Wrangler 本地缓存与构建产物
+.wrangler/
+dist/
+
+# 本地环境变量：密钥只放这里或 Cloudflare 后台，绝不要提交
+.env
+.dev.vars
+*.local
+
+# 真实部署配置（含你的 D1 id / 账号），由 wrangler.toml.example 复制而来
+wrangler.toml
+
+# 电子书与扫描件：体积大、多为受版权保护的内容，只放本地
+public/books/*.epub
+public/books/*.pdf
+public/books/covers/*.jpg
+books-src/*
+!books-src/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
