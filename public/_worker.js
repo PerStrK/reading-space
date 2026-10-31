@@ -11,6 +11,7 @@
  *   OPENROUTER_KEY              OpenRouter 的 API Key，划词翻译要用
  *   TRANSLATE_MODEL             可选，主翻译模型
  *   TRANSLATE_FALLBACK          可选，备用翻译模型
+ *   TRANSLATE_FALLBACK2         可选，第二备用翻译模型
  *   DB                          D1 绑定名
  *
  * Cookie 只带 sub（用户名），角色在服务端按账号查——客户端无法自称 admin。
@@ -452,8 +453,9 @@ async function delReadingBookmark(url, env, me) {
 // 主模型：nemotron-3.5-super-vl 免费档，实测中位 2.9 秒、6 次里成功 5 次，
 //       输出格式最标准（词性+释义+英文例句+中文翻译），日常零成本。
 // 备用：DeepSeek flash 最便宜的一档（约 $0.0001/次），免费档限流 429 时顶上。
-const TR_DEFAULT_MODEL = "nvidia/nemotron-3.5-super-vl:free";
-const TR_FALLBACK_MODEL = "~deepseek/deepseek-flash-latest";
+const TR_DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
+const TR_FALLBACK_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
+const TR_FALLBACK2_MODEL = "~deepseek/deepseek-flash-latest";
 
 async function sha256hex(str) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
@@ -531,7 +533,8 @@ async function handleTranslate(request, env, me) {
   // 主模型出不来可用结果（空、报错、把思考过程当答案）就换备用模型再试
   const plans = [
     { model: env.TRANSLATE_MODEL || TR_DEFAULT_MODEL, max: 500 },
-    { model: env.TRANSLATE_FALLBACK || TR_FALLBACK_MODEL, max: 1400 },
+    { model: env.TRANSLATE_FALLBACK || TR_FALLBACK_MODEL, max: 900 },
+    { model: env.TRANSLATE_FALLBACK2 || TR_FALLBACK2_MODEL, max: 1400 },
   ];
   const SYS = isWord
     ? "英汉词典。只输出两行，不要思考过程、不要步骤、不要 Markdown、不要加粗。" +

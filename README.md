@@ -263,8 +263,9 @@ npm run deploy
 | `AUTH_SECRET` | 建议 | **Secret** | 会话签名密钥，32 字节以上随机串。不填则退化为用密码派生（改密码会让所有会话失效） |
 | `AUTH_VER` | — | 明文 | 会话版本号。改密码后 +1 可让已发出的 Cookie 立即失效 |
 | `OPENROUTER_KEY` | 翻译需要 | **Secret** | OpenRouter API Key，不填则翻译接口返回 501 |
-| `TRANSLATE_MODEL` | — | 明文 | 主翻译模型，默认 `nvidia/nemotron-3.5-super-vl:free` |
-| `TRANSLATE_FALLBACK` | — | 明文 | 备用模型，主模型失败时自动切，默认 `~deepseek/deepseek-flash-latest` |
+| `TRANSLATE_MODEL` | — | 明文 | 主翻译模型，默认 `nvidia/nemotron-3-ultra-550b-a55b:free` |
+| `TRANSLATE_FALLBACK` | — | 明文 | 第一备用模型，默认 `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` |
+| `TRANSLATE_FALLBACK2` | — | 明文 | 第二备用模型，默认 `~deepseek/deepseek-flash-latest` |
 | `SITE_URL` | — | 明文 | 你的站点地址，会作为 `HTTP-Referer` 发给 OpenRouter（仅用于用量归因） |
 | `TEST_USER` / `TEST_PASS` | — | 明文 / Secret | 可选的第三个「试用」账号，数据独立 |
 
