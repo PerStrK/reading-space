@@ -1461,6 +1461,24 @@ async function adminApi(request, url, env, me, path) {
     return json({ ok: true, register_open: !!b.register_open });
   }
 
+  if (path === "/api/admin/books/share" && request.method === "POST") {
+    const id = String(b.id || "");
+    const u = String(b.username || "");
+    if (!id || !u) return json({ ok: false, error: "missing id/username" }, 400);
+    const book = await env.DB.prepare("SELECT id FROM books WHERE id = ?").bind(id).first();
+    if (!book) return json({ ok: false, error: "没有这本书" }, 404);
+    const usr = await env.DB.prepare("SELECT username FROM users WHERE username = ?").bind(u).first();
+    if (!usr) return json({ ok: false, error: "没有这个账号" }, 404);
+    if (b.on) {
+      await env.DB.prepare("INSERT OR IGNORE INTO user_books (user, book_id, added_at) VALUES (?,?,?)")
+        .bind(u, id, Date.now()).run();
+    } else {
+      // 摘展示不删文件：之后还能再勾回来；真删书走 books/delete
+      await env.DB.prepare("DELETE FROM user_books WHERE user = ? AND book_id = ?").bind(u, id).run();
+    }
+    return json({ ok: true });
+  }
+
   if (path === "/api/admin/books/delete" && request.method === "POST") {
     const id = String(b.id || "");
     if (!id) return json({ ok: false, error: "missing id" }, 400);
@@ -1493,16 +1511,23 @@ async function adminHtml(env) {
         : `<button data-del="${esc(u.username)}">删除</button>`}</td>
     </tr>`).join("");
 
-  const bookRows = d.books.map((b) => `
+  const bookRows = d.books.map((b) => {
+    const ownerSet = new Set(String(b.owners || "").split(",").filter(Boolean));
+    const chips = d.users
+      .filter((u) => !u.disabled && u.role !== "admin")
+      .map((u) => `<label style="display:inline-block;margin:0 8px 5px 0;white-space:nowrap"><input type="checkbox" data-share="${esc(b.id)}" data-user="${esc(u.username)}"${ownerSet.has(u.username) ? " checked" : ""}> ${esc(u.username)}${u.username === b.uploader ? "（传）" : ""}</label>`)
+      .join("");
+    return `
     <tr>
       <td><b>${esc(b.title || b.id)}</b><br><small>${esc(b.author || "")}</small></td>
       <td>${b.format.toUpperCase()}</td>
       <td>${mb(b.size)}</td>
       <td>${esc(b.uploader || "")}</td>
-      <td>${esc(b.owners || "（无人）")}</td>
+      <td>${chips || "（无可展示的账号）"}</td>
       <td>${when(b.created_at)}</td>
       <td><button data-delbook="${esc(b.id)}">删除</button></td>
-    </tr>`).join("");
+    </tr>`;
+  }).join("");
 
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>后台管理 · 阅读空间</title>
@@ -1602,6 +1627,11 @@ async function adminHtml(env) {
     if (!confirm("删除这本书？所有人的书架上都会消失，文件也会清掉。")) return;
     try { await post("/api/admin/books/delete", { id: el.dataset.delbook }); location.reload(); }
     catch (e) { alert(e.message); }
+  }));
+  document.querySelectorAll("[data-share]").forEach((el) => el.addEventListener("change", async () => {
+    try {
+      await post("/api/admin/books/share", { id: el.dataset.share, username: el.dataset.user, on: el.checked });
+    } catch (e) { el.checked = !el.checked; alert(e.message); }
   }));
 </script>
 </body></html>`;
