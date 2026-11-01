@@ -61,12 +61,28 @@ CREATE TABLE IF NOT EXISTS vocab (
   first_at    INTEGER,
   last_at     INTEGER,
   src         TEXT,                  -- reading | manual | local
+  mastered    INTEGER NOT NULL DEFAULT 0,   -- 1 = 已标记「已掌握」，页面上归到已掌握区
+  mastered_at INTEGER,
   PRIMARY KEY (user, word, book)
 );
 
 CREATE INDEX IF NOT EXISTS idx_vocab_last ON vocab(user, last_at DESC);
 
--- 账号偏好：目前只有「划词自动入库」一个开关，按账号分开存
+-- 句子表：整句/整段翻译时自动收进来的原句+译文，按账号分开
+-- （老库没有这两列/这张表也没关系：worker 首次用到时会自动补建，见 ensureVocabCols / ensureSentences）
+CREATE TABLE IF NOT EXISTS sentences (
+  user     TEXT NOT NULL,
+  src      TEXT NOT NULL,            -- 原句（英文）
+  dst      TEXT NOT NULL,            -- 译文
+  book     TEXT NOT NULL DEFAULT '',
+  first_at INTEGER,
+  last_at  INTEGER,
+  PRIMARY KEY (user, src)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sentences_user ON sentences(user, first_at DESC);
+
+-- 账号偏好（旧表，保留兼容）：「划词自动入库」已改为 app_settings 里的全站开关，由管理员控制
 CREATE TABLE IF NOT EXISTS user_settings (
   user        TEXT PRIMARY KEY,
   auto_vocab  INTEGER NOT NULL DEFAULT 0,

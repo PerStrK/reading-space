@@ -92,6 +92,15 @@ export default {
     }
     if (path === "/api/vocab/export") return exportVocab(url, env, me);
     if (path === "/api/vocab/users") return listVocabUsers(env, me);
+    if (path === "/api/vocab/master") {
+      if (request.method !== "POST") return json({ ok: false, error: "POST only" }, 405);
+      return setVocabMastered(request, env, me);
+    }
+    if (path === "/api/sentences") {
+      if (request.method === "DELETE") return delSentence(url, env, me);
+      return listSentences(url, env, me);
+    }
+    if (path === "/api/sentences/users") return listSentenceUsers(env, me);
 
     // ---- 账号偏好（按账号分开存）----
     if (path === "/api/settings") {
@@ -529,7 +538,10 @@ async function handleTranslate(request, env, me) {
   // 版本前缀：zh4 起单词要多给音标，旧的（没音标的）缓存自动失效
   const hash = await sha256hex("zh4|" + text);
   const hit = await env.DB.prepare("SELECT dst FROM translations WHERE hash = ?").bind(hash).first();
-  if (hit && hit.dst) return json({ ok: true, text: hit.dst, ipa: pickIpa(hit.dst), cached: true });
+  if (hit && hit.dst) {
+    await recordSentence(env, me, text, hit.dst);
+    return json({ ok: true, text: hit.dst, ipa: pickIpa(hit.dst), cached: true });
+  }
 
   // 主模型出不来可用结果（空、报错、把思考过程当答案）就换备用模型再试
   const plans = [
@@ -605,6 +617,7 @@ async function handleTranslate(request, env, me) {
   await env.DB.prepare(
     "INSERT OR REPLACE INTO translations (hash, src, dst, model, created_at) VALUES (?,?,?,?,?)"
   ).bind(hash, text.slice(0, 300), clean.slice(0, 1200), usedModel, Date.now()).run();
+  await recordSentence(env, me, text, clean);
 
   return json({ ok: true, text: clean, ipa: pickIpa(clean), cached: false });
 }
@@ -612,32 +625,49 @@ async function handleTranslate(request, env, me) {
 /* ---------- 账号偏好 ---------- */
 
 async function getSettings(env, me) {
-  const out = { ok: true, auto_vocab: false, user: me.user, role: me.role };
+  // 「划词自动入库」是全站开关，由管理员控制（后台管理页或管理员在阅读器里切换）；
+  // 存 app_settings.auto_vocab，只有管理员能改；没有设置过时默认开启
+  const out = { ok: true, auto_vocab: true, can_control: me.role === "admin", user: me.user, role: me.role };
   if (!env.DB) return json(out);
-  try {
-    const row = await env.DB.prepare("SELECT auto_vocab FROM user_settings WHERE user = ?")
-      .bind(me.user).first();
-    out.auto_vocab = !!(row && row.auto_vocab);
-  } catch (e) {
-    out.note = "settings_table_missing";
-  }
+  out.auto_vocab = (await getAppSetting(env, "auto_vocab")) !== "0";
   return json(out);
 }
 
 async function saveSettings(request, env, me) {
   let b;
   try { b = await request.json(); } catch (e) { return json({ ok: false, error: "bad json" }, 400); }
-  const auto = b.auto_vocab ? 1 : 0;
-  if (!env.DB) return json({ ok: true, auto_vocab: !!auto, note: "no_db" });
-  try {
-    await env.DB.prepare(
-      "INSERT INTO user_settings (user, auto_vocab, updated_at) VALUES (?,?,?) " +
-      "ON CONFLICT(user) DO UPDATE SET auto_vocab = excluded.auto_vocab, updated_at = excluded.updated_at"
-    ).bind(me.user, auto, Date.now()).run();
-  } catch (e) {
-    return json({ ok: false, error: String((e && e.message) || e).slice(0, 120) }, 500);
+  if (!env.DB) return json({ ok: true, auto_vocab: !!b.auto_vocab, can_control: me.role === "admin", note: "no_db" });
+  if (me.role !== "admin") {
+    // 普通账号改不动：回当前全站状态，让阅读器把按钮恢复原样
+    const cur = (await getAppSetting(env, "auto_vocab")) !== "0";
+    return json({ ok: true, auto_vocab: cur, can_control: false, note: "admin_only" });
   }
-  return json({ ok: true, auto_vocab: !!auto });
+  await setAppSetting(env, "auto_vocab", b.auto_vocab ? "1" : "0");
+  return json({ ok: true, auto_vocab: !!b.auto_vocab, can_control: true });
+}
+
+let _vocabColsOk = false;
+async function ensureVocabCols(env) {
+  // 老库的 vocab 表没有 mastered 列时补上（新库 schema.sql 已带）
+  if (_vocabColsOk || !env.DB) return;
+  try { await env.DB.prepare("SELECT mastered FROM vocab LIMIT 1").all(); _vocabColsOk = true; return; } catch (e) {}
+  try { await env.DB.prepare("ALTER TABLE vocab ADD COLUMN mastered INTEGER NOT NULL DEFAULT 0").run(); } catch (e) {}
+  try { await env.DB.prepare("ALTER TABLE vocab ADD COLUMN mastered_at INTEGER").run(); } catch (e) {}
+  _vocabColsOk = true;
+}
+
+async function setVocabMastered(request, env, me) {
+  let b;
+  try { b = await request.json(); } catch (e) { return json({ ok: false, error: "bad json" }, 400); }
+  const word = normWord(b.word);
+  const book = String(b.book || "").slice(0, 60);
+  if (!word || !book) return json({ ok: false, error: "missing" }, 400);
+  await ensureVocabCols(env);
+  const m = b.mastered ? 1 : 0;
+  await env.DB.prepare(
+    "UPDATE vocab SET mastered = ?, mastered_at = ? WHERE user = ? AND word = ? AND book = ?"
+  ).bind(m, m ? Date.now() : null, me.user, word, book).run();
+  return json({ ok: true, mastered: !!m });
 }
 
 async function addVocab(request, env, me) {
@@ -687,7 +717,8 @@ async function listVocab(url, env, me) {
   const asUser = String(url.searchParams.get("user") || "").slice(0, 40);
   const target = me.role === "admin" && asUser ? asUser : me.user;
   const book = String(url.searchParams.get("book") || "").slice(0, 60);
-  const cols = "SELECT word, book, cfi, sentence, translation, note, hits, first_at, last_at, src FROM vocab WHERE user = ?";
+  await ensureVocabCols(env);
+  const cols = "SELECT word, book, cfi, sentence, translation, note, hits, first_at, last_at, src, mastered, mastered_at FROM vocab WHERE user = ?";
   // 按加入顺序排：新加入的在最前（first_at 倒序，老数据没有 first_at 时退回 last_at）
   const ord = " ORDER BY COALESCE(first_at, last_at) DESC, last_at DESC";
   const r = book
@@ -695,6 +726,61 @@ async function listVocab(url, env, me) {
     : await env.DB.prepare(cols + ord).bind(target).all();
   const items = (r.results || []).map((it) => ({ ...it, ipa: pickIpa(it.translation || "") }));
   return json({ items, user: target, self: me.user, role: me.role });
+}
+
+let _sentOk = false;
+async function ensureSentences(env) {
+  if (_sentOk || !env.DB) return;
+  try {
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS sentences (user TEXT NOT NULL, src TEXT NOT NULL, dst TEXT NOT NULL, " +
+      "book TEXT NOT NULL DEFAULT '', first_at INTEGER, last_at INTEGER, PRIMARY KEY (user, src))"
+    ).run();
+    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_sentences_user ON sentences(user, first_at DESC)").run();
+  } catch (e) {}
+  _sentOk = true;
+}
+
+async function recordSentence(env, me, src, dst) {
+  // 整句/整段翻译自动进「句子表」：按账号存原句+译文；同一句再翻只更新译文，不挪位置。
+  // 失败绝不影响翻译本身，所以全程吞掉异常。
+  try {
+    if (!env.DB || !me || !me.user) return;
+    if (isSingleWord(src)) return;
+    await ensureSentences(env);
+    const now = Date.now();
+    await env.DB.prepare(
+      "INSERT INTO sentences (user, src, dst, book, first_at, last_at) VALUES (?,?,?,'',?,?) " +
+      "ON CONFLICT(user, src) DO UPDATE SET dst = excluded.dst, last_at = excluded.last_at"
+    ).bind(me.user, String(src).slice(0, 600), String(dst).slice(0, 1200), now, now).run();
+  } catch (e) {}
+}
+
+async function listSentences(url, env, me) {
+  await ensureSentences(env);
+  const asUser = String(url.searchParams.get("user") || "").slice(0, 40);
+  const target = me.role === "admin" && asUser ? asUser : me.user;
+  const r = await env.DB.prepare(
+    "SELECT src, dst, book, first_at, last_at FROM sentences WHERE user = ? ORDER BY COALESCE(first_at, last_at) DESC, last_at DESC"
+  ).bind(target).all();
+  return json({ items: r.results || [], user: target, self: me.user, role: me.role });
+}
+
+async function delSentence(url, env, me) {
+  await ensureSentences(env);
+  const src = String(url.searchParams.get("src") || "").slice(0, 600);
+  if (!src) return json({ ok: false, error: "missing src" }, 400);
+  await env.DB.prepare("DELETE FROM sentences WHERE user = ? AND src = ?").bind(me.user, src).run();
+  return json({ ok: true });
+}
+
+async function listSentenceUsers(env, me) {
+  if (me.role !== "admin") return json({ ok: false, error: "admin only" }, 403);
+  await ensureSentences(env);
+  const r = await env.DB.prepare(
+    "SELECT user, COUNT(*) AS n FROM sentences GROUP BY user ORDER BY n DESC, user ASC"
+  ).all();
+  return json({ ok: true, users: r.results || [] });
 }
 
 async function listVocabUsers(env, me) {
@@ -1412,7 +1498,8 @@ function forbiddenHtml() {
 }
 
 async function adminData(env) {
-  const data = { register_open: (await getAppSetting(env, "register_open")) === "1", users: [], books: [] };
+  const data = { register_open: (await getAppSetting(env, "register_open")) === "1",
+    auto_vocab: (await getAppSetting(env, "auto_vocab")) !== "0", users: [], books: [] };
   if (!env.DB) return data;
   try {
     const u = await env.DB.prepare(
@@ -1472,8 +1559,16 @@ async function adminApi(request, url, env, me, path) {
   }
 
   if (path === "/api/admin/settings" && request.method === "POST") {
-    await setAppSetting(env, "register_open", b.register_open ? "1" : "0");
-    return json({ ok: true, register_open: !!b.register_open });
+    const out = { ok: true };
+    if (Object.prototype.hasOwnProperty.call(b, "register_open")) {
+      await setAppSetting(env, "register_open", b.register_open ? "1" : "0");
+      out.register_open = !!b.register_open;
+    }
+    if (Object.prototype.hasOwnProperty.call(b, "auto_vocab")) {
+      await setAppSetting(env, "auto_vocab", b.auto_vocab ? "1" : "0");
+      out.auto_vocab = !!b.auto_vocab;
+    }
+    return json(out);
   }
 
   if (path === "/api/admin/books/share" && request.method === "POST") {
@@ -1587,6 +1682,15 @@ async function adminHtml(env) {
   </div>
 
   <div class="card">
+    <h2 style="margin-top:0">划词自动入库</h2>
+    <div class="switch">
+      <span>翻译单词自动进生词本：<b id="avState">${d.auto_vocab ? "已开启" : "已关闭"}</b></span>
+      <button id="avToggle">${d.auto_vocab ? "关闭" : "开启"}</button>
+    </div>
+    <p class="sub" style="margin-top:8px">开启后，任何人划词翻译，单词都会自动存进各自的生词本并在书里高亮；关闭后只能在阅读器里手动点「存生词」。这个开关由管理员统一控制，普通账号在阅读器里改不了。</p>
+  </div>
+
+  <div class="card">
     <h2 style="margin-top:0">账号（${d.users.length}）</h2>
     <table><tr><th>用户名</th><th>身份</th><th>来源</th><th>创建时间</th><th></th></tr>${userRows || '<tr><td colspan="5">还没有数据库账号</td></tr>'}</table>
     <h2>新增账号</h2>
@@ -1613,6 +1717,11 @@ async function adminHtml(env) {
     if (!j.ok) throw new Error(j.error || ("http " + r.status));
     return j;
   }
+  document.getElementById("avToggle").addEventListener("click", async () => {
+    const now = document.getElementById("avState").textContent.includes("已开启");
+    try { await post("/api/admin/settings", { auto_vocab: !now }); location.reload(); }
+    catch (e) { alert(e.message); }
+  });
   document.getElementById("regToggle").addEventListener("click", async () => {
     const now = document.getElementById("regState").textContent.includes("已开放");
     try { await post("/api/admin/settings", { register_open: !now }); location.reload(); }

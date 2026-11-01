@@ -17,6 +17,7 @@
   var FLOW = ls(LS_FLOW, "scrolled");
   var LS_VOCAB = "rs_rd_auto_vocab";
   var AUTO_VOCAB = ls(LS_VOCAB, false) === true;   // 划词/高亮后是否自动进生词本
+  var CAN_CONTROL = true;   // 「自动入库」全站开关只有管理员能改，服务端 /api/settings 下发
 
   function ls(key, def) {
     try { var v = JSON.parse(localStorage.getItem(key) || "null"); return v == null ? def : v; }
@@ -528,12 +529,14 @@
           AUTO_VOCAB = j.auto_vocab;
           lsSet(LS_VOCAB, AUTO_VOCAB);
         }
+        if (j && typeof j.can_control === "boolean") CAN_CONTROL = j.can_control;
       })
       .catch(function () {})
       .then(markVocabButtons);
   }
 
   function saveAutoVocab(on) {
+    if (!CAN_CONTROL) { tip("「自动入库」由管理员统一控制"); markVocabButtons(); return; }
     AUTO_VOCAB = !!on;
     lsSet(LS_VOCAB, AUTO_VOCAB);
     markVocabButtons();

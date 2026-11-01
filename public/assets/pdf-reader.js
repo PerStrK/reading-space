@@ -33,6 +33,7 @@
       pendingPage = 0, targetPage = 0, wantPage = 1, userPicked = false;
   var curPct = 0, saveTimer = null, popState = { text: "", rects: [], page: 0, hl: -1 };
   var AUTO_VOCAB = ls(LS_VOCAB, false) === true;
+  var CAN_CONTROL = true;   // 「自动入库」全站开关只有管理员能改，服务端 /api/settings 下发
   var popLock = 0;
 
   // ---- 翻页方式 ----
@@ -90,9 +91,11 @@
   function loadSettings() {
     return api("/api/settings").then(function (j) {
       if (j && typeof j.auto_vocab === "boolean") { AUTO_VOCAB = j.auto_vocab; lsSet(LS_VOCAB, AUTO_VOCAB); }
+      if (j && typeof j.can_control === "boolean") CAN_CONTROL = j.can_control;
     }).catch(function () {}).then(markVocabButtons);
   }
   function saveAutoVocab(on) {
+    if (!CAN_CONTROL) { tip("「自动入库」由管理员统一控制"); markVocabButtons(); return; }
     AUTO_VOCAB = !!on;
     lsSet(LS_VOCAB, AUTO_VOCAB);
     markVocabButtons();

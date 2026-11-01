@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>句子表 · 阅读空间</title>
+<meta name="description" content="阅读空间：句子表——整句翻译过的句子，上面原句、下面译文。">
+<link rel="stylesheet" href="assets/site.css?v=20261031">
+<script src="/assets/account.js?v=20261102" defer></script>
+<style>
+.top{padding:20px 0 6px}
+.top .wrap{display:flex; align-items:center; gap:12px}
+.brand{display:flex; align-items:center; gap:10px; text-decoration:none; color:inherit; min-width:0}
+.brand .mark{width:34px; height:34px; flex:0 0 auto; border-radius:11px; background:#c2352b; color:#fff;
+  display:grid; place-items:center; font-family:Georgia,"Songti SC",serif; font-size:19px}
+.brand b{font-family:Georgia,"Songti SC",serif; font-size:18px; letter-spacing:.06em; white-space:nowrap}
+.brand .tag{font-size:11.5px; color:var(--muted); letter-spacing:.2em; white-space:nowrap}
+[hidden]{display:none !important}
+.acct{margin-left:auto; font-size:11.5px; font-weight:600; padding:4px 11px; border-radius:999px;
+  background:#e7f2ec; color:#0f6e56; border:1px solid #bfe0d0; white-space:nowrap}
+.out{margin-left:12px; font-size:12.5px; color:var(--muted); text-decoration:none;
+  border-bottom:1px solid #d9cfbd; padding-bottom:1px; white-space:nowrap}
+.out:hover{color:#c2352b; border-color:#c2352b}
+@media (max-width:560px){ .brand .tag{display:none} }
+
+.vhead{display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-top:24px}
+.vhead h1{font-family:Georgia,"Songti SC",serif; font-size:22px; margin:0}
+.vhead .cnt{color:var(--muted); font-size:13.5px}
+
+.users{display:flex; flex-wrap:wrap; gap:8px; margin-top:16px}
+.users .ulab{font-size:12.5px; color:var(--muted); align-self:center}
+.users button{font:inherit; font-size:13px; padding:6px 14px; border-radius:999px; cursor:pointer;
+  border:1px solid var(--line); background:#fffdf9; color:var(--ink)}
+.users button.on{background:var(--ink); color:#fff; border-color:var(--ink)}
+
+.vlist{margin-top:18px; display:flex; flex-direction:column; gap:12px}
+.vw{background:#fffdf9; border:1px solid var(--line); border-radius:14px; padding:15px 18px 13px; box-shadow:var(--shadow)}
+.vw-head{display:flex; align-items:flex-start; gap:10px}
+.vw .src{font-family:Georgia,serif; font-size:16.5px; line-height:1.6; color:var(--ink); word-break:break-word}
+.vw .del{margin-left:auto; flex:0 0 auto; font:inherit; font-size:12px; padding:4px 11px; border-radius:8px; cursor:pointer;
+  border:1px solid var(--line); background:#fff; color:var(--muted)}
+.vw .del:hover{border-color:#c2352b; color:#c2352b}
+.vw .del.armed{background:#c2352b; border-color:#c2352b; color:#fff}
+.vw .dst{margin-top:8px; font-size:14.5px; line-height:1.65; color:#3d382f; white-space:pre-wrap; word-break:break-word;
+  background:#f7f1e3; border-left:3px solid #d9c58f; border-radius:0 8px 8px 0; padding:8px 12px}
+.vw .meta{margin-top:9px; font-size:12px; color:var(--muted); display:flex; gap:14px; flex-wrap:wrap}
+.empty{margin-top:30px; text-align:center; color:var(--muted); font-size:14.5px; line-height:2;
+  border:1.5px dashed #cfc2a6; border-radius:16px; background:#fffdf9; padding:34px 20px}
+.loading{margin-top:30px; text-align:center; color:var(--muted); font-size:14px}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="index.html">
+      <span class="mark">阅</span><b>阅读空间</b><span class="tag">句 子 · 表</span>
+    </a>
+    <span class="acct" id="acct" hidden></span>
+    <a class="out" href="/logout">退出</a>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="vhead">
+    <h1 id="whos">句子表</h1>
+    <span class="cnt" id="cnt"></span>
+  </div>
+  <div class="users" id="users" hidden></div>
+  <div class="vlist" id="vlist"><div class="loading">正在打开句子表…</div></div>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let me = null, viewUser = null;
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+async function api(path, opt) {
+  const r = await fetch(path, Object.assign({ credentials: "same-origin" }, opt || {}));
+  return r.json();
+}
+function fmtDay(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+
+async function init() {
+  try { me = await api("/api/me"); } catch (e) { me = null; }
+  if (!me || !me.user) { $("vlist").innerHTML = '<div class="empty">没能确认登录状态，请刷新重试。</div>'; return; }
+  viewUser = me.user;
+  if (me.role === "admin") {
+    try {
+      const j = await api("/api/sentences/users");
+      const users = (j && j.users) || [];
+      if (!users.some((u) => u.user === me.user)) users.unshift({ user: me.user, n: 0 });
+      if (users.length > 1) renderUsers(users);
+    } catch (e) {}
+  }
+  load();
+}
+
+function renderUsers(users) {
+  const box = $("users");
+  box.innerHTML = "";
+  const lab = document.createElement("span");
+  lab.className = "ulab"; lab.textContent = "看谁的句子表：";
+  box.appendChild(lab);
+  users.forEach((u) => {
+    const b = document.createElement("button");
+    b.textContent = u.user + "（" + u.n + "）";
+    if (u.user === viewUser) b.className = "on";
+    b.onclick = () => {
+      viewUser = u.user;
+      box.querySelectorAll("button").forEach((x) => x.classList.remove("on"));
+      b.classList.add("on");
+      load();
+    };
+    box.appendChild(b);
+  });
+  box.hidden = false;
+}
+
+async function load() {
+  const own = viewUser === me.user;
+  $("whos").textContent = own ? "我的句子表" : "「" + viewUser + "」的句子表";
+  $("vlist").innerHTML = '<div class="loading">正在打开句子表…</div>';
+  const q = own ? "" : "?user=" + encodeURIComponent(viewUser);
+  let j;
+  try { j = await api("/api/sentences" + q); } catch (e) { j = null; }
+  const items = (j && j.items) || [];
+  $("cnt").textContent = items.length ? "共 " + items.length + " 句 · 新收的在最前" : "";
+  if (!items.length) {
+    $("vlist").innerHTML = '<div class="empty">' +
+      (own ? "还没有句子。<br>在书里选中一整句点「翻译」，它就会自动收进这里。"
+           : "这个账号还没有收过句子。") + "</div>";
+    return;
+  }
+  $("vlist").innerHTML = items.map((it) =>
+    '<article class="vw"><div class="vw-head"><span class="src">' + esc(it.src) + "</span>" +
+    (own ? '<button class="del" data-s="' + esc(it.src) + '">删除</button>' : "") +
+    "</div>" +
+    '<div class="dst">' + esc(it.dst) + "</div>" +
+    '<div class="meta">' + (it.first_at ? "<span>加入于 " + fmtDay(it.first_at) + "</span>" : "") + "</div></article>"
+  ).join("");
+  if (own) {
+    $("vlist").querySelectorAll(".del").forEach((b) => {
+      b.onclick = async () => {
+        if (!b.classList.contains("armed")) {
+          b.classList.add("armed");
+          b.textContent = "确认删除？";
+          setTimeout(() => { b.classList.remove("armed"); b.textContent = "删除"; }, 4000);
+          return;
+        }
+        b.disabled = true;
+        try {
+          await api("/api/sentences?src=" + encodeURIComponent(b.dataset.s), { method: "DELETE" });
+          load();
+        } catch (e) { b.disabled = false; b.classList.remove("armed"); b.textContent = "删除"; }
+      };
+    });
+  }
+}
+
+init();
+</script>
+</body>
+</html>

@@ -27,6 +27,11 @@
         vb.textContent = "生词本";
         vb.style.cssText = "color:inherit;margin-right:12px";
         nav.appendChild(vb);
+        var sn = document.createElement("a");
+        sn.href = "/sentences.html";
+        sn.textContent = "句子表";
+        sn.style.cssText = "color:inherit;margin-right:12px";
+        nav.appendChild(sn);
         var up = document.createElement("a");
         up.href = "/upload.html";
         up.textContent = "上传书籍";
