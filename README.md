@@ -34,6 +34,8 @@
 **生词本**
 - 划过的词按书归拢，带原句和位置（点一下能跳回去）
 - 「自动入库」开关：开了之后点翻译就顺带存词并高亮
+- 独立页面 `/vocab.html`（顶部导航有「生词本」入口）：按加入顺序排列、新收的在最前，每条显示音标、中文翻译和原文例句，可逐条删除
+- 生词本按账号独立；管理员可在页面上切换查看所有用户的生词本（只读，删除只能删自己的）
 - 导出 JSON / CSV / Markdown
 
 **阅读进度与书签**
@@ -379,8 +381,9 @@ python3 tools/split_pdf.py ~/Downloads/某本大书.pdf
 | GET / POST | `/api/reading/progress` | 读 / 写阅读进度（`{book, cfi, percent}`） |
 | GET / POST / DELETE | `/api/reading/bookmarks` | 书签列表 / 新增 / 删除 |
 | POST | `/api/translate` | 翻译（`{text}` → `{ok, text, ipa, cached}`） |
-| GET / POST / DELETE | `/api/vocab` | 生词本 |
+| GET / POST / DELETE | `/api/vocab` | 生词本（管理员带 `?user=<账号>` 可查他人的） |
 | GET | `/api/vocab/export?format=json\|csv\|md` | 导出 |
+| GET | `/api/vocab/users` | 管理员专用：各账号的生词数量 |
 | GET / POST | `/api/settings` | 账号偏好（`auto_vocab`） |
 | GET | `/api/books` | 当前账号能看到的数据库书籍（管理员看全部） |
 | POST | `/api/books/upload` | 上传一本书（multipart，字段 `file`） |

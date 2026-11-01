@@ -22,6 +22,11 @@
       try {
         var nav = document.createElement("span");
         nav.style.cssText = "margin-left:10px;font-size:12.5px;white-space:nowrap";
+        var vb = document.createElement("a");
+        vb.href = "/vocab.html";
+        vb.textContent = "生词本";
+        vb.style.cssText = "color:inherit;margin-right:12px";
+        nav.appendChild(vb);
         var up = document.createElement("a");
         up.href = "/upload.html";
         up.textContent = "上传书籍";

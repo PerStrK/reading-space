@@ -91,6 +91,7 @@ export default {
       return listVocab(url, env, me);
     }
     if (path === "/api/vocab/export") return exportVocab(url, env, me);
+    if (path === "/api/vocab/users") return listVocabUsers(env, me);
 
     // ---- 账号偏好（按账号分开存）----
     if (path === "/api/settings") {
@@ -682,12 +683,26 @@ async function addVocab(request, env, me) {
 }
 
 async function listVocab(url, env, me) {
+  // 管理员带 ?user=<账号> 时看那个账号的生词本；其余情况一律只看自己的
+  const asUser = String(url.searchParams.get("user") || "").slice(0, 40);
+  const target = me.role === "admin" && asUser ? asUser : me.user;
   const book = String(url.searchParams.get("book") || "").slice(0, 60);
   const cols = "SELECT word, book, cfi, sentence, translation, note, hits, first_at, last_at, src FROM vocab WHERE user = ?";
+  // 按加入顺序排：新加入的在最前（first_at 倒序，老数据没有 first_at 时退回 last_at）
+  const ord = " ORDER BY COALESCE(first_at, last_at) DESC, last_at DESC";
   const r = book
-    ? await env.DB.prepare(cols + " AND book = ? ORDER BY last_at DESC").bind(me.user, book).all()
-    : await env.DB.prepare(cols + " ORDER BY last_at DESC").bind(me.user).all();
-  return json({ items: r.results || [] });
+    ? await env.DB.prepare(cols + " AND book = ?" + ord).bind(target, book).all()
+    : await env.DB.prepare(cols + ord).bind(target).all();
+  const items = (r.results || []).map((it) => ({ ...it, ipa: pickIpa(it.translation || "") }));
+  return json({ items, user: target, self: me.user, role: me.role });
+}
+
+async function listVocabUsers(env, me) {
+  if (me.role !== "admin") return json({ ok: false, error: "admin only" }, 403);
+  const r = await env.DB.prepare(
+    "SELECT user, COUNT(*) AS n FROM vocab GROUP BY user ORDER BY n DESC, user ASC"
+  ).all();
+  return json({ ok: true, users: r.results || [] });
 }
 
 async function delVocab(url, env, me) {
@@ -705,7 +720,7 @@ async function delVocab(url, env, me) {
 async function exportVocab(url, env, me) {
   const fmt = (url.searchParams.get("format") || "json").toLowerCase();
   const r = await env.DB.prepare(
-    "SELECT word, book, cfi, sentence, translation, note, hits, first_at, last_at, src FROM vocab WHERE user = ? ORDER BY last_at DESC"
+    "SELECT word, book, cfi, sentence, translation, note, hits, first_at, last_at, src FROM vocab WHERE user = ? ORDER BY COALESCE(first_at, last_at) DESC, last_at DESC"
   ).bind(me.user).all();
   const items = r.results || [];
 
