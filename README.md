@@ -128,6 +128,20 @@ pip install -r tools/requirements.txt          # 装 PyMuPDF / Pillow
 
 ---
 
+## 部署方式总览
+
+正式使用有两种部署方式，代码和功能完全一样，区别只在跑在哪、数据放哪：
+
+| | 方式一：Cloudflare Pages | 方式二：自己的服务器 |
+|---|---|---|
+| 运行位置 | Cloudflare 边缘 | 自己的机器（InstaBox / VPS / 家里电脑） |
+| 数据存放 | Cloudflare D1 | 本地文件 `.wrangler/state/`，不出机器 |
+| 费用 | 免费额度内 | 机器本身的费用 |
+| 运维 | 几乎为零，全球可达 | 自己保活进程；机器休眠时首访要等唤醒 |
+| 适合 | 长期稳定对外 | 数据完全自己掌握、先跑起来试试 |
+
+下面先讲本地开发（调试用），再依次讲两种部署方式。
+
 ## 本地开发
 
 ### 1. 准备配置
@@ -181,7 +195,7 @@ npm run dev
 
 ---
 
-## 生产部署
+## 部署方式一：Cloudflare Pages（云端生产部署）
 
 ### 1. 登录 Cloudflare
 
@@ -248,6 +262,54 @@ npm run deploy
 ```
 
 访问 `https://<项目名>.pages.dev` 即可。想绑自己的域名，在 Pages 项目 → Custom domains 里加。
+
+---
+
+## 部署方式二：自己的服务器（InstaBox / VPS 本地运行）
+
+不往 Cloudflare 部署，同一份代码在自己的机器上以 wrangler 本地模式长期运行：D1 变成 `.wrangler/state/` 下的本地文件，账号、上传的书、翻译缓存全部只存这台机器。对外访问靠把端口发布出去，或用反向代理绑自己的域名。本项目在 InstaBox 免费机上就是这样跑的。
+
+### 1. 拉代码、装依赖
+
+```bash
+git clone <本仓库地址> readspace && cd readspace
+npm install          # 或 npm ci（仓库带 package-lock.json）
+cp wrangler.toml.example wrangler.toml
+```
+
+`wrangler.toml` 里 `database_id` 留占位值即可，本地模式用不到真实 id；`[vars]` 里的翻译模型链可以按「环境变量」一节调整。
+
+### 2. 建本地数据库
+
+```bash
+npm run db:init:local
+```
+
+建表语句都带 `IF NOT EXISTS`：首次部署跑一遍，**从旧版本升级后也要再跑一遍**（新版本新增的表靠它补建），重复跑安全。
+
+### 3. 配置账号与密钥
+
+新建 `.dev.vars`（被 `.gitignore` 忽略），内容同「本地开发」第 3 步：`READER_USER/PASS`、`ADMIN_USER/PASS`、`AUTH_SECRET`、`OPENROUTER_KEY`。
+
+环境变量账号只在**首次运行**时播种进数据库（密码转 PBKDF2 哈希），之后账号以 `/admin` 后台为准，改 `.dev.vars` 不会覆盖已有账号。
+
+### 4. 长期运行
+
+```bash
+npx wrangler pages dev public --port 8096 --ip 0.0.0.0
+```
+
+这条命令要一直挂着。用 tmux、systemd、pm2 任选一种托管，并配一个探活看门狗（定时请求本地端口、无响应就重启进程），机器重启或进程崩溃后能自己恢复。本项目在 InstaBox 上的做法：tmux 会话跑服务 + 门户进程每分钟探活 8096、无响应自动拉起。
+
+### 5. 对外访问
+
+把 8096 端口递到公网：InstaBox 用平台的端口发布功能；VPS 用 nginx / Caddy 反代到 `127.0.0.1:8096`，或用 cloudflared 隧道。之后就能绑自己的域名（本项目绑的是 `read.678912.xyz`）。
+
+### 6. 数据与备份
+
+全部数据只有两处：`.wrangler/state/`（账号、上传书籍、翻译缓存等本地 D1 数据）和 `public/books/`（静态书，可选）。备份 = 打包整个项目目录；迁移 = 把目录拷到新机器、装依赖、重新执行第 2、4 步。
+
+> 注意：机器得能被唤醒或常开。InstaBox 免费机闲置 30 分钟自动休眠、连续运行有上限，休眠后有访问会自动唤醒，只是第一次打开稍慢几秒。
 
 ---
 
