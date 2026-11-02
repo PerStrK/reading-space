@@ -57,7 +57,8 @@ export default {
     }
 
     // 站点图标公开放行：iOS「添加到主屏幕」取图标时不带登录态，被挡去登录页就拿不到图标
-    if (path === "/apple-touch-icon.png" || path === "/apple-touch-icon-precomposed.png" || path === "/icon-512.png") {
+    // /sw.js 同理：Service Worker 的更新检查不一定带登录态，挡了会直坏缓存更新
+    if (path === "/apple-touch-icon.png" || path === "/apple-touch-icon-precomposed.png" || path === "/icon-512.png" || path === "/sw.js") {
       return env.ASSETS.fetch(request);
     }
 
@@ -1366,7 +1367,8 @@ async function serveBookCover(env, me, id) {
     const c = await env.DB.prepare("SELECT type, data FROM book_covers WHERE book_id = ?").bind(id).first();
     if (c && c.data) {
       return new Response(blobBytes(c.data), {
-        headers: { "content-type": c.type || "image/jpeg", "cache-control": "private, max-age=86400" },
+        // 书 id 是内容哈希，封面永不变：长缓存（浏览器与 SW 都可放心存）
+        headers: { "content-type": c.type || "image/jpeg", "cache-control": "private, max-age=31536000, immutable" },
       });
     }
   }

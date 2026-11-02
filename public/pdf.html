@@ -234,5 +234,6 @@ body.scrollmode #bot button{opacity:.55}
   s.src = "assets/pdf-reader.js?v=20261031";
   document.body.appendChild(s);
 </script>
+  <script>if ("serviceWorker" in navigator) { window.addEventListener("load", function () { navigator.serviceWorker.register("/sw.js").catch(function () {}); }); }</script>
 </body>
 </html>

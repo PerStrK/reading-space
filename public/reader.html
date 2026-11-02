@@ -172,5 +172,6 @@ body.night #top .ttl{color:#e6edf3} body.night #top .back,body.night #top .ico,b
 <script src="assets/vendor/jszip.min.js"></script>
 <script src="assets/vendor/epub.min.js"></script>
 <script src="assets/reader.js?v=20261031"></script>
+  <script>if ("serviceWorker" in navigator) { window.addEventListener("load", function () { navigator.serviceWorker.register("/sw.js").catch(function () {}); }); }</script>
 </body>
 </html>

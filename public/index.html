@@ -16,5 +16,6 @@
 </head>
 <body>
 <p style="font-family:system-ui,sans-serif;padding:24px">正在前往书架……如果没有自动跳转，请点 <a href="library.html">进入书架</a>。</p>
+  <script>if ("serviceWorker" in navigator) { window.addEventListener("load", function () { navigator.serviceWorker.register("/sw.js").catch(function () {}); }); }</script>
 </body>
 </html>
