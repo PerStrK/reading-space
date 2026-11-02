@@ -2,7 +2,7 @@
    策略：页面外壳 / 静态资源 / 封面 / 书文件用「先出缓存、后台更新」（stale-while-revalidate）；
    /books.json 网络优先（保证书架数据新鲜），断网时回退缓存；/api/ 一律不缓存。
    缓存的都是当前登录用户自己的内容，存在自己浏览器里；登录跳转（/login）永不写入缓存。 */
-const VERSION = "rs-v3";
+const VERSION = "rs-v4";
 const PRECACHE = [
   "/library", "/reader", "/pdf", "/vocab", "/sentences", "/upload",
   "/assets/site.css", "/assets/library.js", "/assets/account.js",
@@ -45,6 +45,17 @@ function fetchFollow(request) {
   return fetch(new Request(request.url, { credentials: "same-origin" }));
 }
 
+/* iOS Safari 不接受 SW 把「跟随过重定向」的响应直接交回给导航：
+   首次打开新页面必报错，刷新时走缓存（存好的副本没有重定向标记）才正常（rs-v3 的教训）。
+   返回前把这类响应重建成一个干净的同内容响应。 */
+async function clean(res) {
+  if (!res || !res.redirected) return res;
+  const body = await res.blob();
+  const headers = new Headers(res.headers);
+  headers.delete("content-length");
+  return new Response(body, { status: res.status, statusText: res.statusText, headers });
+}
+
 async function swr(request) {
   const cache = await caches.open(VERSION);
   const hit = await cache.match(request, { ignoreSearch: true });
@@ -58,7 +69,7 @@ async function swr(request) {
     .catch(() => null);
   if (hit) return hit;
   const res = await network;
-  if (res) return res;
+  if (res) return clean(res);
   return new Response("offline", { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } });
 }
 
@@ -69,7 +80,7 @@ async function networkFirst(request) {
     if (res && res.ok && !isLoginRedirect(request, res)) {
       cache.put(request, res.clone()).catch(() => {});
     }
-    return res;
+    return clean(res);
   } catch (err) {
     const hit = await cache.match(request, { ignoreSearch: true });
     if (hit) return hit;
