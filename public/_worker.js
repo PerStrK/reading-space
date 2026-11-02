@@ -56,6 +56,11 @@ export default {
       });
     }
 
+    // 站点图标公开放行：iOS「添加到主屏幕」取图标时不带登录态，被挡去登录页就拿不到图标
+    if (path === "/apple-touch-icon.png" || path === "/apple-touch-icon-precomposed.png" || path === "/icon-512.png") {
+      return env.ASSETS.fetch(request);
+    }
+
     const me = await session(request, secret, env);
     if (!me) {
       return new Response(null, {
