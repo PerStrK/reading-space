@@ -2,7 +2,7 @@
    策略：页面外壳 / 静态资源 / 封面 / 书文件用「先出缓存、后台更新」（stale-while-revalidate）；
    /books.json 网络优先（保证书架数据新鲜），断网时回退缓存；/api/ 一律不缓存。
    缓存的都是当前登录用户自己的内容，存在自己浏览器里；登录跳转（/login）永不写入缓存。 */
-const VERSION = "rs-v4";
+const VERSION = "rs-v5";
 const PRECACHE = [
   "/library", "/reader", "/pdf", "/vocab", "/sentences", "/upload",
   "/assets/site.css", "/assets/library.js", "/assets/account.js",
@@ -41,8 +41,18 @@ function isLoginRedirect(request, response) {
 /* 关键：导航请求的 redirect 模式是 manual，直接 fetch(request) 会把
    /reader.html 的 308 跳转原样交回浏览器、导致导航失败（rs-v1 的教训）。
    一律用同 URL 新构造的请求抓取（默认 follow），拿到最终页面再返回/缓存。 */
+/* 站点把 /xxx.html 308 跳到无后缀的 /xxx。Safari 只要发现 SW 交回的
+   导航响应「经历过重定向」就整页拒绝（"Response served by service worker
+   has redirections"，用户实测截图确认）。所以从源头绕开：抓取前先把
+   .html 地址改成无后缀地址，让这次抓取本身就不产生重定向。 */
+function mapUrl(u) {
+  const url = new URL(u);
+  if (url.pathname.endsWith(".html")) url.pathname = url.pathname.slice(0, -5);
+  return url.href;
+}
+
 function fetchFollow(request) {
-  return fetch(new Request(request.url, { credentials: "same-origin" }));
+  return fetch(new Request(mapUrl(request.url), { credentials: "same-origin" }));
 }
 
 /* iOS Safari 不接受 SW 把「跟随过重定向」的响应直接交回给导航：
@@ -58,11 +68,14 @@ async function clean(res) {
 
 async function swr(request) {
   const cache = await caches.open(VERSION);
-  const hit = await cache.match(request, { ignoreSearch: true });
+  const hit = (await cache.match(request, { ignoreSearch: true })) ||
+    (await cache.match(mapUrl(request.url), { ignoreSearch: true }));
   const network = fetchFollow(request)
     .then((res) => {
       if (res && res.ok && !isLoginRedirect(request, res)) {
         cache.put(request, res.clone()).catch(() => {});
+        const mapped = mapUrl(request.url);
+        if (mapped !== request.url) cache.put(mapped, res.clone()).catch(() => {});
       }
       return res;
     })
