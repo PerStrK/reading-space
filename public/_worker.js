@@ -897,7 +897,7 @@ async function exportVocab(url, env, me) {
 const PBKDF2_ITERS = 100000;
 const CHUNK_SIZE = 512 * 1024;              // 避开 D1 单值 1MB 上限
 const MAX_UPLOAD = 64 * 1024 * 1024;        // 单本上限 64MB
-const MAX_COVER = 900 * 1024;
+const MAX_COVER = 990000;                   // 封面上限：D1 单值 1,000,000 字节是硬顶，留一点余量（原 900KB 曾误伤 968KB 的 PNG 封面）
 
 function labelFor(role) {
   return { admin: "管理员", test: "试用", user: "读者", child: "孩子" }[role] || "读者";
