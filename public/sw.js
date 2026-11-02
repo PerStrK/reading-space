@@ -2,9 +2,9 @@
    策略：页面外壳 / 静态资源 / 封面 / 书文件用「先出缓存、后台更新」（stale-while-revalidate）；
    /books.json 网络优先（保证书架数据新鲜），断网时回退缓存；/api/ 一律不缓存。
    缓存的都是当前登录用户自己的内容，存在自己浏览器里；登录跳转（/login）永不写入缓存。 */
-const VERSION = "rs-v1";
+const VERSION = "rs-v2";
 const PRECACHE = [
-  "/library.html", "/reader.html", "/pdf.html", "/vocab.html", "/sentences.html", "/upload.html",
+  "/library", "/reader", "/pdf", "/vocab", "/sentences", "/upload",
   "/assets/site.css", "/assets/library.js", "/assets/account.js",
   "/assets/reader.js", "/assets/pdf-reader.js",
   "/assets/vendor/jszip.min.js", "/assets/vendor/epub.min.js",
@@ -38,10 +38,17 @@ function isLoginRedirect(request, response) {
   }
 }
 
+/* 关键：导航请求的 redirect 模式是 manual，直接 fetch(request) 会把
+   /reader.html 的 308 跳转原样交回浏览器、导致导航失败（rs-v1 的教训）。
+   一律用同 URL 新构造的请求抓取（默认 follow），拿到最终页面再返回/缓存。 */
+function fetchFollow(request) {
+  return fetch(new Request(request.url, { credentials: "same-origin" }));
+}
+
 async function swr(request) {
   const cache = await caches.open(VERSION);
   const hit = await cache.match(request, { ignoreSearch: true });
-  const network = fetch(request)
+  const network = fetchFollow(request)
     .then((res) => {
       if (res && res.ok && !isLoginRedirect(request, res)) {
         cache.put(request, res.clone()).catch(() => {});
@@ -58,7 +65,7 @@ async function swr(request) {
 async function networkFirst(request) {
   const cache = await caches.open(VERSION);
   try {
-    const res = await fetch(request);
+    const res = await fetchFollow(request);
     if (res && res.ok && !isLoginRedirect(request, res)) {
       cache.put(request, res.clone()).catch(() => {});
     }
