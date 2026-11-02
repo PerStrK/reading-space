@@ -557,13 +557,15 @@ async function handleTranslate(request, env, me) {
       "单词：第一行写词性 + 中文释义，第二行给一句简短英文例句；句子：只给译文。中文不超过 60 字。";
   let clean = "";          // 最终采用
   let noIpa = "";          // 备胎：有中文释义但没音标（单词才会用到）
+  let noIpaModel = "";
   let lastErr = "";
   let usedModel = "";
-  // 单词要求必须带音标：没有音标就当"还不够好"，换备用模型再试一次；
-  // 但两次都没音标也不会报错，返回有释义的版本就行。
-  for (let attempt = 0; attempt < plans.length && !clean; attempt++) {
-    const plan = plans[attempt];
-    usedModel = plan.model;
+
+  // 单次尝试，带时间盒：免费大模型在 OpenRouter 排队时能磨一分钟以上，
+  // 没有超时的话它会吃掉全部时间，后面的备选永远轮不上，网关先把连接掐了。
+  // 单词要求必须带音标：没有音标就当"还不够好"，先留作备胎，换备用模型再试；
+  // 但都没音标也不会报错，返回有释义的版本就行。
+  async function tryPlan(plan, timeoutMs) {
     const body = {
       model: plan.model,
       messages: [
@@ -574,41 +576,81 @@ async function handleTranslate(request, env, me) {
       temperature: 0,
       reasoning: { exclude: true },   // 思考过程别回传，省得混进正文
     };
+    const hdrs = {
+      "content-type": "application/json",
+      authorization: "Bearer " + env.OPENROUTER_KEY,
+      // OpenRouter 用它做用量归因，可选
+      "X-Title": "reading-space",
+    };
+    if (env.SITE_URL) hdrs["HTTP-Referer"] = env.SITE_URL;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
     let r;
     try {
-      const hdrs = {
-        "content-type": "application/json",
-        authorization: "Bearer " + env.OPENROUTER_KEY,
-        // OpenRouter 用它做用量归因，可选
-        "X-Title": "reading-space",
-      };
-      if (env.SITE_URL) hdrs["HTTP-Referer"] = env.SITE_URL;
       r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
         headers: hdrs,
         body: JSON.stringify(body),
+        signal: ctl.signal,
       });
     } catch (e) {
-      lastErr = "network";
-      continue;
+      clearTimeout(timer);
+      return { kind: "fail", err: "network" };
     }
+    clearTimeout(timer);
     if (!r.ok) {
       const t = await r.text().catch(() => "");
-      lastErr = "upstream " + r.status + " " + t.slice(0, 120);
-      continue;
+      return { kind: "fail", err: "upstream " + r.status + " " + t.slice(0, 120) };
     }
     const j = await r.json().catch(() => null);
     const msg = (((j || {}).choices || [])[0] || {}).message || {};
     // 只认 content；reasoning 一律不用（它装的是模型的思考草稿，不是译文）
     const got = polishTranslation(msg.content || "");
     if (!usableTranslation(got)) {
-      lastErr = "unusable (" + ((j || {}).model || "?") + ")";
-    } else if (!isWord || pickIpa(got)) {
-      clean = got;                       // 够好，收下
-    } else if (!noIpa) {
-      noIpa = got;                       // 有释义但缺音标，先留住
+      return { kind: "fail", err: "unusable (" + ((j || {}).model || "?") + ")", model: plan.model };
+    }
+    if (!isWord || pickIpa(got)) return { kind: "clean", text: got, model: plan.model };  // 够好，收下
+    return { kind: "noipa", text: got, model: plan.model };   // 有释义但缺音标，先留住
+  }
+
+  function absorb(res) {
+    if (!res) return;
+    if (res.kind === "clean" && !clean) {
+      clean = res.text;
+      usedModel = res.model;
+    } else if (res.kind === "noipa" && !noIpa) {
+      noIpa = res.text;
+      noIpaModel = res.model;
+    } else if (res.err) {
+      lastErr = res.err;
     }
   }
+
+  // 两个免费模型对冲：先发第一个；它先结束却没出最终答案就立刻发第二个，
+  // 6 秒还没结束也把第二个发出去——谁先给出够好的答案就用谁。
+  await new Promise((resolve) => {
+    const total = Math.min(2, plans.length);
+    let started = 0, settled = 0, finished = false;
+    const done = () => { if (!finished) { finished = true; resolve(); } };
+    const launch = (idx) => {
+      if (idx >= total || finished) return;
+      started++;
+      tryPlan(plans[idx], 25000).then((res) => {
+        absorb(res);
+        settled++;
+        if (clean) return done();
+        if (idx === 0 && started < total) launch(1);
+        if (settled >= total) done();
+      });
+    };
+    launch(0);
+    setTimeout(() => { if (!finished && !clean && started < total) launch(1); }, 6000);
+  });
+  // 免费模型都没出最终答案，最后用 DeepSeek 兜底（快、稳）
+  if (!clean && plans.length > 2) {
+    absorb(await tryPlan(plans[2], 25000));
+  }
+  if (!clean && noIpa) usedModel = noIpaModel;
   if (!clean) clean = noIpa;             // 音标没要到，至少把释义给出来
   if (!usableTranslation(clean)) {
     return json({ ok: false, error: lastErr || "translate failed", hint: "翻译服务暂时不可用，稍后再试" }, 502);

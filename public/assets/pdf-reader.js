@@ -663,10 +663,37 @@
   }
 
   /* ---------- 划词气泡 ---------- */
-  function showPop(text, rects, page) {
+  // 把选区扩展到所在的完整句子：在整页文字里按句末标点切分，取包含选区的那一句
+  function expandSentence(full, selText) {
+    var norm = function (s) { return String(s || "").replace(/\s+/g, " ").trim(); };
+    var text = norm(full), sel = norm(selText);
+    if (!text || !sel) return "";
+    var at = text.indexOf(sel);
+    if (at < 0) return "";
+    var start = 0, end = text.length;
+    var lm = text.slice(0, at).match(/^[\s\S]*[.!?。！？…]+(?:["'"'”’)\]]+)?\s+/);
+    if (lm) start = lm[0].length;
+    var rm = text.slice(at + sel.length).match(/[.!?。！？…]+(?:["'"'”’)\]]+)?/);
+    if (rm) end = at + sel.length + rm.index + rm[0].length;
+    var out = text.slice(start, end).trim();
+    return out.length >= sel.length ? out : "";
+  }
+  // PDF：文字层是 pdf.js 的 span 序列，整页拼起来再取完整句
+  function pageSentence(host, selText) {
+    try {
+      var spans = host.querySelectorAll(".tl span");
+      var joined = "", spaced = "";
+      for (var i = 0; i < spans.length; i++) {
+        joined += spans[i].textContent;
+        spaced += spans[i].textContent + " ";
+      }
+      return expandSentence(joined, selText) || expandSentence(spaced, selText);
+    } catch (e) { return ""; }
+  }
+  function showPop(text, rects, page, sentence) {
     var p = page || pageNo;
     var hi = hitHighlight(text, rects, p);
-    popState = { text: text, rects: rects, page: p, hl: hi };
+    popState = { text: text, rects: rects, page: p, hl: hi, sentence: sentence || "" };
     pop.innerHTML =
       '<div class="hd">' +
         '<div class="w"></div>' +
@@ -718,14 +745,23 @@
     });
     return keep.slice(-2).join("\n") || "这段没拿到干净的译文，再点一次「翻译」试试。";
   }
-  function translate(text) {
-    showTrans("翻译中…", true);
+  function translateOnce(text) {
     return api("/api/translate", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ text: text })
     }).then(function (j) {
       if (!j.ok) throw new Error(j.hint || j.error || "翻译失败");
-      var out = cleanTrans(j.text);
+      return cleanTrans(j.text);
+    });
+  }
+  function translate(text) {
+    showTrans("翻译中…", true);
+    return translateOnce(text).catch(function () {
+      // 慢请求可能被网关先掐断，但服务端常已算完并存入缓存，重试一次多半秒回
+      showTrans("翻译中…（再试一次）", true);
+      return new Promise(function (res) { setTimeout(res, 2500); })
+        .then(function () { return translateOnce(text); });
+    }).then(function (out) {
       showTrans(out, false);
       return out;
     }).catch(function (e) {
@@ -738,7 +774,7 @@
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({
         word: text.slice(0, 60), book: BID, cfi: "pdf:p" + activePage(),
-        sentence: text.slice(0, 300), translation: translation || "", src: "pdf", fill: !!fill
+        sentence: (popState.sentence || text).slice(0, 300), translation: translation || "", src: "pdf", fill: !!fill
       })
     });
   }
@@ -826,7 +862,7 @@
     var rects = normRects(Array.prototype.slice.call(range.getClientRects()), box);
     if (!rects.length) return;
     if (pop.classList.contains("on") && popState.text === text) return;
-    showPop(text, rects, pn || pageNo);
+    showPop(text, rects, pn || pageNo, pageSentence(host, text));
   }
   document.addEventListener("selectionchange", function () {
     clearTimeout(onSelect._t);

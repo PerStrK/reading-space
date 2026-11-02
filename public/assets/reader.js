@@ -235,12 +235,38 @@
   }
 
   /* ---------- 划词气泡 ---------- */
-  var popState = { cfi: "", text: "", trans: "", mark: "" };
+  var popState = { cfi: "", text: "", trans: "", mark: "", sentence: "" };
   var popLock = 0;   // 最近一次在气泡里按下/触摸的时间
 
-  function showPop(text, cfiRange) {
+  // 把选区扩展到所在的完整句子：在整段文字里按句末标点切分，取包含选区的那一句
+  function expandSentence(full, selText) {
+    var norm = function (s) { return String(s || "").replace(/\s+/g, " ").trim(); };
+    var text = norm(full), sel = norm(selText);
+    if (!text || !sel) return "";
+    var at = text.indexOf(sel);
+    if (at < 0) return "";
+    var start = 0, end = text.length;
+    var lm = text.slice(0, at).match(/^[\s\S]*[.!?。！？…]+(?:["'"'”’)\]]+)?\s+/);
+    if (lm) start = lm[0].length;
+    var rm = text.slice(at + sel.length).match(/[.!?。！？…]+(?:["'"'”’)\]]+)?/);
+    if (rm) end = at + sel.length + rm.index + rm[0].length;
+    var out = text.slice(start, end).trim();
+    return out.length >= sel.length ? out : "";
+  }
+  // EPUB：从选区所在段落的文字里取完整句
+  function sentenceAround(range, selText) {
+    try {
+      var node = range && range.startContainer;
+      var block = node && node.nodeType === 3 ? node.parentElement : node;
+      while (block && !/^(P|DIV|LI|BLOCKQUOTE|H1|H2|H3|H4|H5|H6|TD|DD|DT)$/.test(block.tagName || "")) block = block.parentElement;
+      if (!block) return "";
+      return expandSentence(String(block.textContent || ""), selText);
+    } catch (e) { return ""; }
+  }
+
+  function showPop(text, cfiRange, sentence) {
     var markCfi = hlHit(cfiRange);
-    popState = { cfi: cfiRange, text: text, trans: "", mark: markCfi };
+    popState = { cfi: cfiRange, text: text, trans: "", mark: markCfi, sentence: sentence || "" };
     pop.innerHTML =
       '<div class="hd">' +
         '<div class="w"></div>' +
@@ -302,15 +328,24 @@
     return keep.slice(-2).join("\n") || "这段没拿到干净的译文，再点一次「翻译」试试。";
   }
 
-  function translate(text) {
-    showTrans("翻译中…", true);
+  function translateOnce(text) {
     return api("/api/translate", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ text: text })
     }).then(function (j) {
       if (!j.ok) throw new Error(j.hint || j.error || "翻译失败");
-      var out = cleanTrans(j.text);
+      return cleanTrans(j.text);
+    });
+  }
+  function translate(text) {
+    showTrans("翻译中…", true);
+    return translateOnce(text).catch(function () {
+      // 慢请求可能被网关先掐断，但服务端常已算完并存入缓存，重试一次多半秒回
+      showTrans("翻译中…（再试一次）", true);
+      return new Promise(function (res) { setTimeout(res, 2500); })
+        .then(function () { return translateOnce(text); });
+    }).then(function (out) {
       showTrans(out, false);
       popState.trans = out;
       return out;
@@ -328,7 +363,7 @@
         word: text.slice(0, 60),
         book: BID,
         cfi: popState.cfi,
-        sentence: text.slice(0, 300),
+        sentence: (popState.sentence || text).slice(0, 300),
         translation: translation || "",
         src: "reading",
         fill: !!fill
@@ -439,9 +474,10 @@
       if (Date.now() - popLock < 700) return;
       if (pop.classList.contains("on") && popState.cfi === cfiRange) return;
       var text = "";
-      try { text = rendition.getRange(cfiRange).toString(); } catch (e) {}
+      var range = null;
+      try { range = rendition.getRange(cfiRange); text = range.toString(); } catch (e) {}
       if (!text || !text.trim()) return;
-      showPop(text.trim(), cfiRange);
+      showPop(text.trim(), cfiRange, sentenceAround(range, text.trim()));
     });
 
     // 点击左右两侧翻页（只在分页模式；滚动模式下不拦点击）
