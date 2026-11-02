@@ -2,7 +2,7 @@
    策略：页面外壳 / 静态资源 / 封面 / 书文件用「先出缓存、后台更新」（stale-while-revalidate）；
    /books.json 网络优先（保证书架数据新鲜），断网时回退缓存；/api/ 一律不缓存。
    缓存的都是当前登录用户自己的内容，存在自己浏览器里；登录跳转（/login）永不写入缓存。 */
-const VERSION = "rs-v2";
+const VERSION = "rs-v3";
 const PRECACHE = [
   "/library", "/reader", "/pdf", "/vocab", "/sentences", "/upload",
   "/assets/site.css", "/assets/library.js", "/assets/account.js",
@@ -86,12 +86,12 @@ self.addEventListener("fetch", (e) => {
   if (p.startsWith("/api/")) return;                    // 接口永远走网络
   if (p === "/books.json") { e.respondWith(networkFirst(request)); return; }
   if (p === "/sw.js") return;
+  if (p.startsWith("/bookfile/")) return;               // 书文件不经缓存层：直连网络（大文件经 SW 克隆转发在 iOS 上首读易坏，刷新走缓存才正常——rs-v3 教训）
   if (
     request.mode === "navigate" ||
     p.endsWith(".html") || p === "/" ||
     p.startsWith("/assets/") ||
     p.startsWith("/bookcover/") ||
-    p.startsWith("/bookfile/") ||
     p === "/apple-touch-icon.png" || p === "/icon-512.png"
   ) {
     e.respondWith(swr(request));
