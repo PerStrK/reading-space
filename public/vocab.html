@@ -193,7 +193,21 @@ async function load() {
       (c.sentence_zh ? '<p class="sent"><b>原句翻译</b>' + esc(c.sentence_zh) + "</p>" : "") +
       "</div>";
   };
+  const senseBlock = (s) => {
+    const head = ((s.pos ? s.pos + " " : "") + (s.zh || "")).trim();
+    if (!s.ex_en) return head ? '<p class="sent">' + esc(head) + "</p>" : "";
+    const aud = (s.audio_uk || s.audio_us)
+      ? '<span class="auds">' +
+        (s.audio_uk ? '<button class="aud" data-h="' + esc(s.ex_h) + '" data-a="uk">🔊 英读</button>' : "") +
+        (s.audio_us ? '<button class="aud" data-h="' + esc(s.ex_h) + '" data-a="us">🔊 美读</button>' : "") +
+        "</span>"
+      : "";
+    return '<p class="sent">' + esc(head) + "</p>" +
+      '<p class="sent"><b>例句</b>' + esc(s.ex_en) + aud + "</p>" +
+      (s.ex_zh ? '<p class="sent"><b>例句翻译</b>' + esc(s.ex_zh) + "</p>" : "");
+  };
   const card = (it) => {
+    const hasSenseEx = (it.senses || []).some((s) => s.ex_en);
     const body = (it.senses && it.senses.length)
       ? it.senses.map((s) => ((s.pos ? s.pos + " " : "") + (s.zh || "")).trim()).filter(Boolean).join("\n")
       : trBody(it);
@@ -219,12 +233,14 @@ async function load() {
       (own ? '<span class="ops">' + mst +
              '<button class="del" data-w="' + esc(it.word) + '" data-b="' + esc(it.book) + '">删除</button></span>' : "") +
       "</div>" +
-      (body ? '<div class="tr">' + esc(body) + "</div>"
-            : '<div class="tr empty">（暂无译文，下次在书里点到它会自动补上）</div>') +
+      ((it.senses && it.senses.length)
+        ? '<div class="senses">' + it.senses.map(senseBlock).join("") + "</div>"
+        : (body ? '<div class="tr">' + esc(body) + "</div>"
+            : '<div class="tr empty">（暂无译文，下次在书里点到它会自动补上）</div>')) +
       (ctxs || (it.sentence ? '<p class="sent"><b>原句</b>' + esc(it.sentence) + "</p>" : "") +
       (it.sentence_zh ? '<p class="sent"><b>原句翻译</b>' + esc(it.sentence_zh) + "</p>" : "")) +
-      (it.example ? '<p class="sent"><b>例句</b>' + esc(it.example) + "</p>" : "") +
-      (it.example_zh ? '<p class="sent"><b>例句翻译</b>' + esc(it.example_zh) + "</p>" : "") +
+      (!hasSenseEx && it.example ? '<p class="sent"><b>例句</b>' + esc(it.example) + "</p>" : "") +
+      (!hasSenseEx && it.example_zh ? '<p class="sent"><b>例句翻译</b>' + esc(it.example_zh) + "</p>" : "") +
       (it.note ? '<div class="note">备注：' + esc(it.note) + "</div>" : "") +
       '<div class="meta"><span>📖 ' + esc(it.book_title || it.book) + "</span>" +
       (it.first_at ? "<span>加入于 " + fmtDay(it.first_at) + "</span>" : "") +

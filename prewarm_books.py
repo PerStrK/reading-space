@@ -19,6 +19,7 @@ import fcntl
 import html as htmlmod
 import io
 import re
+import json
 import sqlite3
 import sys
 import time
@@ -211,23 +212,32 @@ def main():
         if not todo:
             print(f"{book[:8]}: complete ({len(targets)} words)", flush=True)
             continue
-        sentences = split_sentences(text)
         made = 0
         for w in todo:
             if time.time() - started > TIMEBOX_S:
                 break
             # Prewarm is FREE-MODELS-ONLY (user rule): every lookup below
-            # goes through E.word_entry_free / E.translate_free, which
-            # never touch the paid fallback.
-            store = conn.execute("SELECT def FROM word_store WHERE word = ?", (w,)).fetchone()
-            sents = first_sentences(sentences, w, 3)
-            uncached = [s for s in sents if not E.cached(conn, s)]
-            costly = not (store and store["def"]) or bool(uncached)
+            # goes through E.word_entry_free, which never touches the paid
+            # fallback. v2 (2026-11-03, user design): prewarm no longer
+            # stores the book's original sentences. The stored example for
+            # a word is ONE SHORT SIMPLE sentence per sense, generated to
+            # match the sense's meaning/usage; the same sense reappearing
+            # anywhere reuses it, a new sense appends a new example.
+            store = conn.execute("SELECT def, senses FROM word_store WHERE word = ?", (w,)).fetchone()
+            have_def = bool(store and store["def"])
+            have_ex = False
+            if have_def and store["senses"]:
+                try:
+                    have_ex = any((s.get("ex_en") or "").strip()
+                                  for s in (json.loads(store["senses"]) or [])
+                                  if isinstance(s, dict))
+                except Exception:
+                    have_ex = False
+            costly = not have_def or not have_ex
             if costly and budget[0] <= 0:
                 break
             if costly:
                 budget[0] -= 1
-            if not (store and store["def"]):
                 entry, _used = E.word_entry_free(conn, w, timeout=20)
                 if entry:
                     E.seed_store_full(conn, w, entry)
@@ -240,13 +250,17 @@ def main():
                                     "UPDATE word_store SET uk_ipa = COALESCE(NULLIF(uk_ipa,''), ?), "
                                     "us_ipa = COALESCE(NULLIF(us_ipa,''), ?) WHERE word = ?",
                                     (pair[0], pair[1], w))
-            for s in uncached:
-                E.translate_free(conn, s, False, timeout=20)
-            have = conn.execute("SELECT def FROM word_store WHERE word = ?", (w,)).fetchone()
+            have = conn.execute("SELECT def, senses FROM word_store WHERE word = ?", (w,)).fetchone()
             if not (have and have["def"]):
                 continue  # no definition yet; leave the word for a later run
+            examples = []
+            try:
+                examples = [s["ex_en"] for s in (json.loads(have["senses"]) or [])
+                            if isinstance(s, dict) and (s.get("ex_en") or "").strip()]
+            except Exception:
+                examples = []
             with conn:
-                for s in (sents or [""]):
+                for s in (examples or [""]):
                     conn.execute("INSERT OR IGNORE INTO book_words (book, word, sentence) VALUES (?,?,?)",
                                  (book, w, s))
             made += 1

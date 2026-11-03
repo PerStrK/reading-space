@@ -495,11 +495,11 @@ const WORD_SCHEMA = {
   properties: {
     uk_ipa: { type: "string", description: "英式国际音标，两侧带斜杠，如 /ˈmɪərkæt/" },
     us_ipa: { type: "string", description: "美式国际音标，两侧带斜杠" },
-    senses_text: { type: "string", description: "最常用的前三个义项，每个义项以词性缩写开头（如 n. / v. / adj.），义项之间用中文分号；分隔，如：n. 魔杖；v. 挥舞" },
-    example_en: { type: "string", description: "一句简短英文例句" },
+    senses_text: { type: "string", description: "最常用的前三个义项，义项之间用中文分号；分隔。每个义项格式：词性缩写 中文义 | 一句简单英文例句（不超过12个常用词，专为该义项而写，不要用书里的原句） | 该例句的中文翻译。如：n. 魔杖 | The witch waves her wand. | 女巫挥舞她的魔杖；v. 挥舞 | He waves his hand. | 他挥了挥手" },
+    example_en: { type: "string", description: "第一个义项的例句（与 senses_text 里第一个义项的例句相同）" },
     example_zh: { type: "string", description: "上面例句的中文翻译" },
   },
-  required: ["uk_ipa", "us_ipa", "senses_text", "example_en", "example_zh"],
+  required: ["uk_ipa", "us_ipa", "senses_text"],
   additionalProperties: false,
 };
 const PHRASE_SCHEMA = {
@@ -802,20 +802,27 @@ async function translateCore(env, me, text) {
         };
         let senses = [];
         if (typeof d.senses_text === "string" && d.senses_text) {
-          // "n. 义一；闲逛；v. 义二" -> [{pos, zh}...]: a segment starting
-          // with a POS token opens a new sense; bare segments continue
-          // the previous sense's gloss.
+          // v2 segment: "n. 义 | Simple example. | 例句译" — a segment
+          // starting with a POS token opens a new sense carrying its own
+          // simple example; bare segments continue the previous gloss.
           for (const seg of d.senses_text.split(/[;；]/)) {
-            const t = seg.trim();
-            if (!t) continue;
+            const raw = seg.trim();
+            if (!raw) continue;
+            const parts = raw.split(/[|｜]/).map((x) => x.trim());
+            const t = parts[0];
+            const exEn = (parts[1] || "").slice(0, 200);
+            const exZh = (parts[2] || "").slice(0, 120);
             const pm = t.match(/^([A-Za-z]+\.?|名词|动词|形容词|副词|介词|连词|代词|感叹词|数词|冠词)\s+(.+)$/);
             if (pm && hasZh(pm[2])) {
-              if (senses.length < 3) senses.push({ pos: normPos(pm[1]), zh: cleanDef(pm[2], normPos(pm[1])).slice(0, 60) });
+              if (senses.length < 3) senses.push({ pos: normPos(pm[1]), zh: cleanDef(pm[2], normPos(pm[1])).slice(0, 60), ex_en: exEn, ex_zh: exZh });
               else if (senses.length) senses[senses.length - 1].zh += ";" + t;
+            } else if (senses.length && exEn && !senses[senses.length - 1].ex_en) {
+              senses[senses.length - 1].ex_en = exEn;
+              senses[senses.length - 1].ex_zh = exZh;
             } else if (senses.length && hasZh(t)) {
               senses[senses.length - 1].zh += ";" + t;
             } else if (hasZh(t)) {
-              senses.push({ pos: "", zh: t.slice(0, 60) });
+              senses.push({ pos: "", zh: t.slice(0, 60), ex_en: exEn, ex_zh: exZh });
             }
           }
         }
@@ -828,7 +835,9 @@ async function translateCore(env, me, text) {
           ukIpa = ukIpa || slashIpa(d.ipa);
           usIpa = usIpa || ukIpa;
         }
-        const ex = S(d.example_en), exZh = S(d.example_zh);
+        let ex = S(d.example_en), exZh = S(d.example_zh);
+        if (senses.length && senses[0].ex_en) { ex = senses[0].ex_en; exZh = senses[0].ex_zh || exZh; }
+        if (senses.length && ex && !senses[0].ex_en) { senses[0].ex_en = ex; senses[0].ex_zh = exZh; }
         if (!senses.length || !ukIpa || !ex || !exZh || !hasZh(exZh)) {
           return { kind: "fail", err: "strict invalid fields", model };
         }
@@ -1039,12 +1048,47 @@ async function ensureWordStore(env) {
   _wordStoreOk = true;
 }
 
+function mergeSenses(oldList, newList) {
+  // Union by (pos, zh): a stored sense keeps its place and only gains a
+  // missing example; a genuinely new sense appends with its own simple
+  // example (user rule: same meaning/usage -> one example; a different
+  // sense -> a new example). Cap 5.
+  const out = [];
+  const seen = new Set();
+  for (const s of [...(oldList || []), ...(newList || [])]) {
+    if (!s || typeof s !== "object") continue;
+    const zh = String(s.zh || "").trim();
+    if (!zh) continue;
+    const key = String(s.pos || "") + "|" + zh;
+    if (seen.has(key)) {
+      const cur = out.find((x) => (String(x.pos || "") + "|" + String(x.zh || "").trim()) === key);
+      if (cur && !cur.ex_en && s.ex_en) { cur.ex_en = s.ex_en; cur.ex_zh = s.ex_zh || ""; }
+      continue;
+    }
+    seen.add(key);
+    out.push({ pos: s.pos || "", zh, ex_en: s.ex_en || "", ex_zh: s.ex_zh || "" });
+  }
+  return out.slice(0, 5);
+}
+
 async function upsertWordStore(env, word, p) {
-  // 只填空缺：先到先得，不覆盖已有内容
+  // 标量字段只填空缺；义项按并集合并（同义项不重复、例句互补，
+  // 新义项追加并自带例句），不再被"先到先得"冻住。
   if (!word || !p || !p.def) return;
   await ensureWordStore(env);
-  const sensesJson = Array.isArray(p.senses) && p.senses.length
-    ? JSON.stringify(p.senses.slice(0, 3)) : "";
+  let merged = null;
+  if (Array.isArray(p.senses) && p.senses.length) {
+    let oldSenses = [];
+    try {
+      const row = await env.DB.prepare("SELECT senses FROM word_store WHERE word = ?").bind(word).first();
+      if (row && row.senses) oldSenses = JSON.parse(row.senses) || [];
+    } catch (e) {}
+    merged = mergeSenses(oldSenses, p.senses);
+    if (merged.length && !p.example && merged[0].ex_en) {
+      p = { ...p, example: merged[0].ex_en, exampleZh: merged[0].ex_zh || p.exampleZh || "" };
+    }
+  }
+  const sensesJson = merged && merged.length ? JSON.stringify(merged) : "";
   await env.DB.prepare(
     "INSERT INTO word_store (word, def, example, example_zh, uk_ipa, us_ipa, senses, updated_at) VALUES (?,?,?,?,?,?,?,?) " +
     "ON CONFLICT(word) DO UPDATE SET " +
@@ -1053,7 +1097,7 @@ async function upsertWordStore(env, word, p) {
     "example_zh = COALESCE(NULLIF(word_store.example_zh,''), excluded.example_zh), " +
     "uk_ipa = COALESCE(NULLIF(word_store.uk_ipa,''), excluded.uk_ipa), " +
     "us_ipa = COALESCE(NULLIF(word_store.us_ipa,''), excluded.us_ipa), " +
-    "senses = COALESCE(NULLIF(word_store.senses,''), excluded.senses), " +
+    "senses = CASE WHEN excluded.senses = '' THEN word_store.senses ELSE excluded.senses END, " +
     "updated_at = excluded.updated_at"
   ).bind(word, p.def || "", p.example || "", p.exampleZh || "",
          p.ukIpa || "", p.usIpa || "", sensesJson, Date.now()).run();
@@ -1179,25 +1223,15 @@ async function addVocab(request, env, me) {
   ).bind(
     me.user, word, book,
     String(b.cfi || "").slice(0, 400),
-    String(b.sentence || "").slice(0, 400),
+    "",  // v2: the original sentence is no longer persisted (see below)
     String(b.translation || "").slice(0, 600),
     String(b.note || "").slice(0, 200),
     now, now, String(b.src || "reading").slice(0, 20),
     sentenceZh, example, exampleZh
   ).run();
-  // 原句单独存一份到 contexts：同一词在不同句子里被划到时，新句子追加进来，
-  // 各自带书名与译文，不再被 vocab 行里的单个 sentence 字段顶掉。
-  await ensureVocabTables(env);
-  const ctxSentence = String(b.sentence || "").slice(0, 400);
-  if (ctxSentence) {
-    await env.DB.prepare(
-      "INSERT INTO vocab_contexts (user, word, book, sentence, sentence_zh, first_at, last_at, hits) " +
-      "VALUES (?,?,?,?,?,?,?,1) " +
-      "ON CONFLICT(user, word, book, sentence) DO UPDATE SET " +
-      "hits = vocab_contexts.hits + 1, last_at = excluded.last_at, " +
-      "sentence_zh = COALESCE(NULLIF(excluded.sentence_zh,''), vocab_contexts.sentence_zh)"
-    ).bind(me.user, word, book, ctxSentence, sentenceZh, now, now).run();
-  }
+  // v2（用户定版）：不再保存原句。生词本只记「谁在哪本书遇见过这个词」
+  // 的关系与时间/次数；长期保存的是按义项存的简单例句（在 word_store
+  // 的 senses 里）。旧 vocab_contexts 数据保留但不再新增。
   // 这次查到的词义顺手沉淀进全局单词库（只填空缺），所有账户共同复用
   try {
     if (trans) {
@@ -1261,9 +1295,28 @@ async function listVocab(url, env, me) {
   // 内容从全局单词库拼装：生词行只存关系，词义/例句/双音标/单词录音都查全局库
   await ensureWordStore(env);
   const storeMap = new Map();
+  const sensesMap = new Map();
   try {
     const sr = await env.DB.prepare("SELECT word, def, example, example_zh, uk_ipa, us_ipa, senses FROM word_store").all();
-    for (const s of sr.results || []) storeMap.set(s.word, s);
+    for (const s of sr.results || []) {
+      storeMap.set(s.word, s);
+      try {
+        const ss = JSON.parse(s.senses || "null");
+        if (Array.isArray(ss) && ss.length) {
+          const enr = [];
+          for (const x of ss) {
+            const o = { ...x };
+            if (o.ex_en) {
+              o.ex_h = await sha256hex(o.ex_en);
+              o.audio_uk = audioSet.has(o.ex_h + "|uk");
+              o.audio_us = audioSet.has(o.ex_h + "|us");
+            }
+            enr.push(o);
+          }
+          sensesMap.set(s.word, enr);
+        }
+      } catch (e) {}
+    }
   } catch (e) {}
   const wAudioSet = new Set();
   try {
@@ -1279,12 +1332,7 @@ async function listVocab(url, env, me) {
       example_zh: it.example_zh || ws.example_zh || "",
       uk_ipa: ws.uk_ipa || it.uk_ipa || "",
       us_ipa: ws.us_ipa || it.us_ipa || "",
-      senses: (() => {
-        try {
-          const ss = JSON.parse(ws.senses || "null");
-          return Array.isArray(ss) && ss.length ? ss : null;
-        } catch (e) { return null; }
-      })(),
+      senses: sensesMap.get(it.word) || null,
       word_audio_uk: wAudioSet.has(it.word + "|uk"),
       word_audio_us: wAudioSet.has(it.word + "|us"),
     };

@@ -72,7 +72,7 @@ WORD2_SCHEMA = {"type": "object",
                 "properties": {
                     "uk_ipa": {"type": "string", "description": "British IPA wrapped in slashes"},
                     "us_ipa": {"type": "string", "description": "American IPA wrapped in slashes"},
-                    "senses_text": {"type": "string", "description": "Up to 3 most common senses, each starting with a POS abbreviation, separated by Chinese semicolons, e.g. 'n. X;v. Y'"},
+                    "senses_text": {"type": "string", "description": "Up to 3 most common senses, separated by Chinese semicolons. Each sense: POS abbreviation + Chinese meaning + ' | ' + ONE SHORT SIMPLE English example for THAT sense (<=12 everyday words) + ' | ' + its Chinese translation, e.g. 'n. \u9b54\u6756 | The witch waves her wand. | \u5973\u5deb\u6325\u821e\u5979\u7684\u9b54\u6756'"},
                     "example_en": {"type": "string", "description": "One short English example sentence"},
                     "example_zh": {"type": "string", "description": "Chinese translation of the example"}},
                 "required": ["uk_ipa", "us_ipa", "senses_text", "example_en", "example_zh"],
@@ -283,23 +283,35 @@ def word2_from_structured(model, word, timeout=45):
         t = seg.strip()
         if not t:
             continue
-        pm = re.match(r"^([A-Za-z]+\.?|\u540d\u8bcd|\u52a8\u8bcd|\u5f62\u5bb9\u8bcd|\u526f\u8bcd|\u4ecb\u8bcd|\u8fde\u8bcd|\u4ee3\u8bcd|\u611f\u53f9\u8bcd|\u6570\u8bcd|\u51a0\u8bcd)\s+(.+)$", t)
+        # v2 segment shape: "pos. zh | simple example en | example zh"
+        parts = [p.strip() for p in re.split(r"[|\uFF5C]", t)]
+        head = parts[0]
+        ex_en = parts[1] if len(parts) > 1 else ""
+        ex_zh = parts[2] if len(parts) > 2 else ""
+        pm = re.match(r"^([A-Za-z]+\.?|\u540d\u8bcd|\u52a8\u8bcd|\u5f62\u5bb9\u8bcd|\u526f\u8bcd|\u4ecb\u8bcd|\u8fde\u8bcd|\u4ee3\u8bcd|\u611f\u53f9\u8bcd|\u6570\u8bcd|\u51a0\u8bcd)\s+(.+)$", head)
         if pm and re.search(r"[\u4e00-\u9fff]", pm.group(2)):
             if len(senses) < 3:
-                senses.append({"pos": _norm_pos(pm.group(1)), "zh": pm.group(2).strip()[:60]})
+                senses.append({"pos": _norm_pos(pm.group(1)), "zh": pm.group(2).strip()[:60],
+                               "ex_en": ex_en[:200], "ex_zh": ex_zh[:120]})
             elif senses:
-                senses[-1]["zh"] += ";" + t
-        elif senses and re.search(r"[\u4e00-\u9fff]", t):
-            senses[-1]["zh"] += ";" + t
-        elif re.search(r"[\u4e00-\u9fff]", t):
-            senses.append({"pos": "", "zh": t[:60]})
+                senses[-1]["zh"] += ";" + head
+        elif senses and ex_en and not senses[-1].get("ex_en"):
+            senses[-1]["ex_en"] = ex_en[:200]
+            senses[-1]["ex_zh"] = ex_zh[:120]
+        elif senses and re.search(r"[\u4e00-\u9fff]", head):
+            senses[-1]["zh"] += ";" + head
+        elif re.search(r"[\u4e00-\u9fff]", head):
+            senses.append({"pos": "", "zh": head[:60], "ex_en": ex_en[:200], "ex_zh": ex_zh[:120]})
     if not senses:
         return None
     uk = _slash_ipa(str(d.get("uk_ipa") or ""))
     us = _slash_ipa(str(d.get("us_ipa") or ""))
+    ex_en = senses[0].get("ex_en") or str(d.get("example_en") or "").strip()
+    ex_zh = senses[0].get("ex_zh") or str(d.get("example_zh") or "").strip()
+    if ex_en and not senses[0].get("ex_en"):
+        senses[0]["ex_en"], senses[0]["ex_zh"] = ex_en[:200], ex_zh[:120]
     return {"uk_ipa": uk, "us_ipa": us, "senses": senses,
-            "example_en": str(d.get("example_en") or "").strip(),
-            "example_zh": str(d.get("example_zh") or "").strip()}
+            "example_en": ex_en, "example_zh": ex_zh}
 
 
 def compose_def_line(entry):
@@ -339,9 +351,11 @@ def entry_from_text(text):
     pm = re.match(r"^([A-Za-z]+\.)\s*(.*)$", rest)
     pos = _norm_pos(pm.group(1)) if pm else ""
     zh = pm.group(2) if pm else rest
-    return {"uk_ipa": ipa, "us_ipa": "", "senses": [{"pos": pos, "zh": zh[:60]}],
-            "example_en": lines[1] if len(lines) > 1 else "",
-            "example_zh": lines[2] if len(lines) > 2 else ""}
+    ex_en = lines[1] if len(lines) > 1 else ""
+    ex_zh = lines[2] if len(lines) > 2 else ""
+    return {"uk_ipa": ipa, "us_ipa": "",
+            "senses": [{"pos": pos, "zh": zh[:60], "ex_en": ex_en[:200], "ex_zh": ex_zh[:120]}],
+            "example_en": ex_en, "example_zh": ex_zh}
 
 
 def translate_free(conn, text, is_word, timeout=20):
@@ -381,13 +395,52 @@ def word_entry_free(conn, word, timeout=20):
     return None, used
 
 
+def merge_senses(old, new):
+    """Union of stored senses and a fresh entry's senses, keyed by
+    (pos, zh): known senses keep their place and only gain a missing
+    example; genuinely new senses append. Cap 5."""
+    out = []
+    seen = set()
+    for s in list(old or []) + list(new or []):
+        if not isinstance(s, dict):
+            continue
+        key = ((s.get("pos") or ""), (s.get("zh") or "").strip())
+        if not key[1]:
+            continue
+        if key in seen:
+            cur = next(x for x in out if ((x.get("pos") or ""), (x.get("zh") or "").strip()) == key)
+            if not cur.get("ex_en") and s.get("ex_en"):
+                cur["ex_en"], cur["ex_zh"] = s["ex_en"], s.get("ex_zh") or ""
+            continue
+        seen.add(key)
+        out.append({"pos": s.get("pos") or "", "zh": s["zh"],
+                    "ex_en": s.get("ex_en") or "", "ex_zh": s.get("ex_zh") or ""})
+    return out[:5]
+
+
 def seed_store_full(conn, word, entry):
-    """Write a rich entry into word_store, filling only empty fields
-    (senses/ipas are set when present and the stored ones are empty)."""
+    """Write a rich entry into word_store: scalar fields fill only when
+    empty; senses are UNION-merged (a sense already stored is never
+    duplicated, a new sense is appended with its own simple example)."""
     if not entry:
         return
     d = compose_def_line(entry)
-    senses_json = json.dumps(entry.get("senses") or [], ensure_ascii=False)
+    old = []
+    row = conn.execute("SELECT senses FROM word_store WHERE word = ?", (word,)).fetchone()
+    if row and row[0]:
+        try:
+            old = json.loads(row[0]) or []
+        except Exception:
+            old = []
+    merged = merge_senses(old, entry.get("senses") or [])
+    if merged:
+        entry = dict(entry)
+        entry["senses"] = merged
+        if not entry.get("example_en") and merged[0].get("ex_en"):
+            entry["example_en"] = merged[0]["ex_en"]
+            entry["example_zh"] = merged[0].get("ex_zh") or ""
+        d = compose_def_line(entry)
+    senses_json = json.dumps(merged, ensure_ascii=False) if merged else ""
     conn.execute(
         "INSERT INTO word_store (word, def, example, example_zh, uk_ipa, us_ipa, senses, updated_at) "
         "VALUES (?,?,?,?,?,?,?,?) "
@@ -397,7 +450,7 @@ def seed_store_full(conn, word, entry):
         "example_zh = COALESCE(NULLIF(word_store.example_zh,''), excluded.example_zh), "
         "uk_ipa = COALESCE(NULLIF(word_store.uk_ipa,''), excluded.uk_ipa), "
         "us_ipa = COALESCE(NULLIF(word_store.us_ipa,''), excluded.us_ipa), "
-        "senses = COALESCE(NULLIF(word_store.senses,''), excluded.senses), "
+        "senses = CASE WHEN excluded.senses = '' THEN word_store.senses ELSE excluded.senses END, "
         "updated_at = excluded.updated_at",
         (word, d, entry.get("example_en") or "", entry.get("example_zh") or "",
          entry.get("uk_ipa") or "", entry.get("us_ipa") or "", senses_json,
@@ -556,7 +609,8 @@ def main():
     try:
         rows = conn.execute(
             "SELECT DISTINCT v.word FROM vocab v LEFT JOIN word_store s ON s.word = v.word "
-            "WHERE s.senses IS NULL OR s.senses = '' OR s.senses = '[]' LIMIT 2").fetchall()
+            "WHERE s.senses IS NULL OR s.senses = '' OR s.senses = '[]' "
+            "OR s.senses NOT LIKE '%ex_en%' LIMIT 2").fetchall()
         for r in rows:
             w = r["word"]
             entry = word2_from_structured(STRICT_FREE_MODEL, w, timeout=20) \
@@ -646,6 +700,24 @@ def main():
 
     # 5) missing sentence audio
     rows = conn.execute("SELECT DISTINCT sentence FROM vocab_contexts LIMIT 200").fetchall()
+    # v2: the per-sense simple examples of vocab words are sentences too --
+    # their UK/US readings are generated the same way (keyed by text hash).
+    try:
+        vrows = conn.execute(
+            "SELECT s.senses FROM word_store s JOIN vocab v ON v.word = s.word "
+            "WHERE s.senses IS NOT NULL AND s.senses <> ''").fetchall()
+        extra = []
+        for vr in vrows:
+            try:
+                for s in json.loads(vr[0]) or []:
+                    ex = (s.get("ex_en") or "").strip()
+                    if ex:
+                        extra.append({"sentence": ex})
+            except Exception:
+                pass
+        rows = rows + extra
+    except Exception:
+        pass
     made = 0
     for r in rows:
         if made >= BATCH_AUDIO:
