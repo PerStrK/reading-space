@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS vocab (
   src         TEXT,                  -- reading | manual | local
   mastered    INTEGER NOT NULL DEFAULT 0,   -- 1 = 已标记「已掌握」，页面上归到已掌握区
   mastered_at INTEGER,
+  sentence_zh TEXT,                  -- 原句的中文翻译
+  example     TEXT,                  -- 词典例句（英文）
+  example_zh  TEXT,                  -- 例句的中文翻译
   PRIMARY KEY (user, word, book)
 );
 
@@ -144,6 +147,7 @@ CREATE TABLE IF NOT EXISTS user_books (
   user     TEXT NOT NULL,
   book_id  TEXT NOT NULL,
   added_at INTEGER,
+  last_open INTEGER,                 -- 最近打开时间（毫秒），书架按它倒序
   PRIMARY KEY (user, book_id)
 );
 

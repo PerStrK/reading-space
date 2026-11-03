@@ -187,7 +187,10 @@ async function load() {
       "</div>" +
       (body ? '<div class="tr">' + esc(body) + "</div>"
             : '<div class="tr empty">（暂无译文，下次在书里点到它会自动补上）</div>') +
-      (it.sentence ? '<p class="sent"><b>原文例句</b>' + esc(it.sentence) + "</p>" : "") +
+      (it.sentence ? '<p class="sent"><b>原句</b>' + esc(it.sentence) + "</p>" : "") +
+      (it.sentence_zh ? '<p class="sent"><b>原句翻译</b>' + esc(it.sentence_zh) + "</p>" : "") +
+      (it.example ? '<p class="sent"><b>例句</b>' + esc(it.example) + "</p>" : "") +
+      (it.example_zh ? '<p class="sent"><b>例句翻译</b>' + esc(it.example_zh) + "</p>" : "") +
       (it.note ? '<div class="note">备注：' + esc(it.note) + "</div>" : "") +
       '<div class="meta"><span>📖 ' + esc(it.book) + "</span>" +
       (it.first_at ? "<span>加入于 " + fmtDay(it.first_at) + "</span>" : "") +

@@ -124,6 +124,10 @@ export default {
       if (request.method !== "POST") return json({ ok: false, error: "POST only" }, 405);
       return removeMyBook(request, env, me);
     }
+    if (path === "/api/books/opened") {
+      if (request.method !== "POST") return json({ ok: false, error: "POST only" }, 405);
+      return markBookOpened(request, env, me);
+    }
 
     // ---- 上传书的文件与封面（按账号可见性把关）----
     if (path.startsWith("/bookfile/")) return serveBookFile(request, env, me, path.slice(10), url);
@@ -501,6 +505,12 @@ function pickIpa(s) {
   return m ? m[1] : "";
 }
 
+/* 单词译文是三行：释义 / 英文例句 / 例句中文翻译，拆开给前端分块展示 */
+function splitWordText(t) {
+  const lines = String(t || "").split(/\n+/).map((x) => x.trim()).filter(Boolean);
+  return { def: lines[0] || "", example: lines[1] || "", exampleZh: lines[2] || "" };
+}
+
 /* 模型偶尔会把思考过程写进正文（尤其实时推理类模型），这里做一次兜底清洗 */
 const COT_TELL = /(thinking process|思考过程|analyze the request|output format|draft\s*[:：]|task\s*[:：]|input\s*[:：]|step\s*\d)/i;
 
@@ -539,14 +549,35 @@ async function handleTranslate(request, env, me) {
   if (!env.OPENROUTER_KEY) {
     return json({ ok: false, error: "no_key", hint: "还没在后台配置 OPENROUTER_KEY" }, 501);
   }
+  const r = await translateCore(env, me, text);
+  if (!r.ok) return json({ ok: false, error: r.error, hint: r.hint }, r.status || 502);
+  const out = { ok: true, text: r.text, ipa: r.ipa, cached: r.cached, is_word: isSingleWord(text) };
+  if (out.is_word) {
+    const p = splitWordText(r.text);
+    out.example = p.example;
+    out.example_zh = p.exampleZh;
+    // 查词时把所在原句也翻出来，前端连原句带译文一起展示
+    const sentence = String(b.sentence || "").trim().slice(0, 400);
+    if (sentence && sentence !== text) {
+      try {
+        const sr = await translateCore(env, me, sentence);
+        if (sr.ok) out.sentence_zh = sr.text;
+      } catch (e) { /* 原句翻译拿不到，不影响单词本身 */ }
+    }
+  }
+  return json(out);
+}
 
+/* 翻译主体：查缓存 → 免费模型对冲 → DeepSeek 兜底 → 存缓存。
+   返回 { ok, text, ipa, cached } 或 { ok:false, status, error, hint }。 */
+async function translateCore(env, me, text) {
   const isWord = isSingleWord(text);
-  // 版本前缀：zh4 起单词要多给音标，旧的（没音标的）缓存自动失效
-  const hash = await sha256hex("zh4|" + text);
+  // 版本前缀：zh5 起单词例句要带中文翻译，旧缓存自动失效
+  const hash = await sha256hex("zh5|" + text);
   const hit = await env.DB.prepare("SELECT dst FROM translations WHERE hash = ?").bind(hash).first();
   if (hit && hit.dst) {
     await recordSentence(env, me, text, hit.dst);
-    return json({ ok: true, text: hit.dst, ipa: pickIpa(hit.dst), cached: true });
+    return { ok: true, text: hit.dst, ipa: pickIpa(hit.dst), cached: true };
   }
 
   // 主模型出不来可用结果（空、报错、把思考过程当答案）就换备用模型再试
@@ -556,11 +587,11 @@ async function handleTranslate(request, env, me) {
     { model: env.TRANSLATE_FALLBACK2 || TR_FALLBACK2_MODEL, max: 1400 },
   ];
   const SYS = isWord
-    ? "英汉词典。只输出两行，不要思考过程、不要步骤、不要 Markdown、不要加粗。" +
+    ? "英汉词典。只输出三行，不要思考过程、不要步骤、不要 Markdown、不要加粗。" +
       "第一行：「/国际音标/ 词性 中文释义」，音标两侧必须加斜杠，例如 /ˈmɪərkæt/ n. 猫鼬；" +
-      "第二行：一句简短英文例句（只写例句，不写译文）。中文释义不超过 40 字。"
+      "第二行：一句简短英文例句；第三行：第二行例句的中文翻译。中文释义不超过 40 字。"
     : "英汉词典。直接给出最终答案，不要思考过程、不要步骤、不要 Markdown。" +
-      "单词：第一行写词性 + 中文释义，第二行给一句简短英文例句；句子：只给译文。中文不超过 60 字。";
+      "词组：第一行写词性 + 中文释义，第二行给一句简短英文例句，第三行给例句的中文翻译；句子：只给译文。中文不超过 60 字。";
   let clean = "";          // 最终采用
   let noIpa = "";          // 备胎：有中文释义但没音标（单词才会用到）
   let noIpaModel = "";
@@ -659,7 +690,7 @@ async function handleTranslate(request, env, me) {
   if (!clean && noIpa) usedModel = noIpaModel;
   if (!clean) clean = noIpa;             // 音标没要到，至少把释义给出来
   if (!usableTranslation(clean)) {
-    return json({ ok: false, error: lastErr || "translate failed", hint: "翻译服务暂时不可用，稍后再试" }, 502);
+    return { ok: false, status: 502, error: lastErr || "translate failed", hint: "翻译服务暂时不可用，稍后再试" };
   }
 
   await env.DB.prepare(
@@ -667,7 +698,7 @@ async function handleTranslate(request, env, me) {
   ).bind(hash, text.slice(0, 300), clean.slice(0, 1200), usedModel, Date.now()).run();
   await recordSentence(env, me, text, clean);
 
-  return json({ ok: true, text: clean, ipa: pickIpa(clean), cached: false });
+  return { ok: true, text: clean, ipa: pickIpa(clean), cached: false };
 }
 
 /* ---------- 账号偏好 ---------- */
@@ -696,12 +727,59 @@ async function saveSettings(request, env, me) {
 
 let _vocabColsOk = false;
 async function ensureVocabCols(env) {
-  // 老库的 vocab 表没有 mastered 列时补上（新库 schema.sql 已带）
+  // 老库缺哪列补哪列，逐列探（新库 schema.sql 已带全部列）
   if (_vocabColsOk || !env.DB) return;
-  try { await env.DB.prepare("SELECT mastered FROM vocab LIMIT 1").all(); _vocabColsOk = true; return; } catch (e) {}
-  try { await env.DB.prepare("ALTER TABLE vocab ADD COLUMN mastered INTEGER NOT NULL DEFAULT 0").run(); } catch (e) {}
-  try { await env.DB.prepare("ALTER TABLE vocab ADD COLUMN mastered_at INTEGER").run(); } catch (e) {}
+  const want = [
+    ["mastered", "INTEGER NOT NULL DEFAULT 0"],
+    ["mastered_at", "INTEGER"],
+    ["sentence_zh", "TEXT"],
+    ["example", "TEXT"],
+    ["example_zh", "TEXT"],
+  ];
+  for (const [col, type] of want) {
+    try { await env.DB.prepare("SELECT " + col + " FROM vocab LIMIT 1").all(); }
+    catch (e) {
+      try { await env.DB.prepare("ALTER TABLE vocab ADD COLUMN " + col + " " + type).run(); } catch (e2) {}
+    }
+  }
   _vocabColsOk = true;
+}
+
+let _ubColsOk = false;
+async function ensureUserBooksCols(env) {
+  // user_books.last_open：最近打开时间，书架按它排序
+  if (_ubColsOk || !env.DB) return;
+  try { await env.DB.prepare("SELECT last_open FROM user_books LIMIT 1").all(); _ubColsOk = true; return; } catch (e) {}
+  try { await env.DB.prepare("ALTER TABLE user_books ADD COLUMN last_open INTEGER").run(); } catch (e) {}
+  _ubColsOk = true;
+}
+
+/* 记一次「打开这本书」：只更新已有书架行，不授予可见性 */
+async function touchBookOpen(env, me, id) {
+  try {
+    await ensureUserBooksCols(env);
+    await env.DB.prepare(
+      "UPDATE user_books SET last_open = ? WHERE user = ? AND book_id = ?"
+    ).bind(Date.now(), me.user, id).run();
+  } catch (e) {}
+}
+
+const _openTouchAt = new Map();
+async function touchBookOpenThrottled(env, me, id) {
+  const k = me.user + "|" + id;
+  const now = Date.now();
+  if (now - (_openTouchAt.get(k) || 0) < 60000) return;
+  _openTouchAt.set(k, now);
+  await touchBookOpen(env, me, id);
+}
+
+async function markBookOpened(request, env, me) {
+  let b;
+  try { b = await request.json(); } catch (e) { return json({ ok: false, error: "bad json" }, 400); }
+  const id = String(b.id || "");
+  if (!/^[0-9a-f]{16}$/.test(id)) return json({ ok: false, error: "bad id" }, 400);
+  await touchBookOpen(env, me, id);
+  return json({ ok: true });
 }
 
 async function setVocabMastered(request, env, me) {
@@ -725,6 +803,10 @@ async function addVocab(request, env, me) {
   const book = String(b.book || "").slice(0, 60);
   if (!word || !book) return json({ ok: false, error: "missing" }, 400);
   const now = Date.now();
+  await ensureVocabCols(env);
+  const sentenceZh = String(b.sentence_zh || "").slice(0, 600);
+  const example = String(b.example || "").slice(0, 400);
+  const exampleZh = String(b.example_zh || "").slice(0, 600);
 
   // fill=true：只是后台把译文补上，不算一次新的划词，hits 不动
   if (b.fill) {
@@ -734,25 +816,36 @@ async function addVocab(request, env, me) {
         "UPDATE vocab SET translation = ? WHERE user = ? AND word = ? AND book = ? AND (translation IS NULL OR translation = '')"
       ).bind(tr, me.user, word, book).run();
     }
+    const extra = [["sentence_zh", sentenceZh], ["example", example], ["example_zh", exampleZh]];
+    for (const [col, val] of extra) {
+      if (!val) continue;
+      await env.DB.prepare(
+        "UPDATE vocab SET " + col + " = ? WHERE user = ? AND word = ? AND book = ? AND (" + col + " IS NULL OR " + col + " = '')"
+      ).bind(val, me.user, word, book).run();
+    }
     const row = await env.DB.prepare(
       "SELECT word, book, hits, translation FROM vocab WHERE user = ? AND word = ? AND book = ?"
     ).bind(me.user, word, book).first();
     return json({ ok: true, item: row || null, fill: true });
   }
   await env.DB.prepare(
-    "INSERT INTO vocab (user, word, book, cfi, sentence, translation, note, hits, first_at, last_at, src) " +
-    "VALUES (?,?,?,?,?,?,?,1,?,?,?) " +
+    "INSERT INTO vocab (user, word, book, cfi, sentence, translation, note, hits, first_at, last_at, src, sentence_zh, example, example_zh) " +
+    "VALUES (?,?,?,?,?,?,?,1,?,?,?,?,?,?) " +
     "ON CONFLICT(user, word, book) DO UPDATE SET " +
     "hits = vocab.hits + 1, last_at = excluded.last_at, cfi = excluded.cfi, " +
     "sentence = COALESCE(NULLIF(excluded.sentence,''), vocab.sentence), " +
-    "translation = COALESCE(NULLIF(excluded.translation,''), vocab.translation)"
+    "translation = COALESCE(NULLIF(excluded.translation,''), vocab.translation), " +
+    "sentence_zh = COALESCE(NULLIF(excluded.sentence_zh,''), vocab.sentence_zh), " +
+    "example = COALESCE(NULLIF(excluded.example,''), vocab.example), " +
+    "example_zh = COALESCE(NULLIF(excluded.example_zh,''), vocab.example_zh)"
   ).bind(
     me.user, word, book,
     String(b.cfi || "").slice(0, 400),
     String(b.sentence || "").slice(0, 400),
     String(b.translation || "").slice(0, 600),
     String(b.note || "").slice(0, 200),
-    now, now, String(b.src || "reading").slice(0, 20)
+    now, now, String(b.src || "reading").slice(0, 20),
+    sentenceZh, example, exampleZh
   ).run();
   const row = await env.DB.prepare(
     "SELECT word, book, hits, translation FROM vocab WHERE user = ? AND word = ? AND book = ?"
@@ -766,7 +859,7 @@ async function listVocab(url, env, me) {
   const target = me.role === "admin" && asUser ? asUser : me.user;
   const book = String(url.searchParams.get("book") || "").slice(0, 60);
   await ensureVocabCols(env);
-  const cols = "SELECT word, book, cfi, sentence, translation, note, hits, first_at, last_at, src, mastered, mastered_at FROM vocab WHERE user = ?";
+  const cols = "SELECT word, book, cfi, sentence, translation, note, hits, first_at, last_at, src, mastered, mastered_at, sentence_zh, example, example_zh FROM vocab WHERE user = ?";
   // 按加入顺序排：新加入的在最前（first_at 倒序，老数据没有 first_at 时退回 last_at）
   const ord = " ORDER BY COALESCE(first_at, last_at) DESC, last_at DESC";
   const r = book
@@ -1126,16 +1219,18 @@ function blobBytes(v) {
 
 async function visibleBookRows(env, me) {
   if (!env.DB) return [];
+  await ensureUserBooksCols(env);
   try {
     if (me.role === "admin") {
       const r = await env.DB.prepare(
-        "SELECT b.*, (SELECT COUNT(*) FROM user_books ub WHERE ub.book_id = b.id) AS owners " +
+        "SELECT b.*, (SELECT COUNT(*) FROM user_books ub WHERE ub.book_id = b.id) AS owners, " +
+        "(SELECT ub2.last_open FROM user_books ub2 WHERE ub2.book_id = b.id AND ub2.user = ?) AS last_open " +
         "FROM books b ORDER BY b.created_at DESC"
-      ).all();
+      ).bind(me.user).all();
       return r.results || [];
     }
     const r = await env.DB.prepare(
-      "SELECT b.*, 1 AS owners FROM books b JOIN user_books ub ON ub.book_id = b.id " +
+      "SELECT b.*, 1 AS owners, ub.last_open AS last_open FROM books b JOIN user_books ub ON ub.book_id = b.id " +
       "WHERE ub.user = ? ORDER BY ub.added_at DESC"
     ).bind(me.user).all();
     return r.results || [];
@@ -1161,6 +1256,7 @@ function bookToEntry(b, me) {
     cover: "bookcover/" + b.id,
     size: b.size,
     added: b.created_at ? new Date(b.created_at).toISOString().slice(0, 10) : "",
+    lastOpen: b.last_open || 0,
     uploaded: true,
     uploader: b.uploader || "",
     owners: b.owners == null ? undefined : b.owners,
@@ -1309,6 +1405,8 @@ async function serveBookFile(request, env, me, rawId, url) {
   const book = await env.DB.prepare("SELECT * FROM books WHERE id = ?").bind(id).first();
   if (!book) return new Response("not found", { status: 404 });
   if (!(await canSeeBook(env, me, id))) return new Response("forbidden", { status: 403 });
+  // 打开文件即记一次「最近打开」（书架排序用）；分片请求 60 秒内不重复写库
+  await touchBookOpenThrottled(env, me, id);
 
   const total = book.size;
   const type = book.format === "pdf" ? "application/pdf" : "application/epub+zip";

@@ -693,7 +693,7 @@
   function showPop(text, rects, page, sentence) {
     var p = page || pageNo;
     var hi = hitHighlight(text, rects, p);
-    popState = { text: text, rects: rects, page: p, hl: hi, sentence: sentence || "" };
+    popState = { text: text, rects: rects, page: p, hl: hi, sentence: sentence || "", extra: null };
     pop.innerHTML =
       '<div class="hd">' +
         '<div class="w"></div>' +
@@ -748,10 +748,10 @@
   function translateOnce(text) {
     return api("/api/translate", {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text: text })
+      body: JSON.stringify({ text: text, sentence: popState.sentence || "" })
     }).then(function (j) {
       if (!j.ok) throw new Error(j.hint || j.error || "翻译失败");
-      return cleanTrans(j.text);
+      return j;
     });
   }
   function translate(text) {
@@ -761,8 +761,21 @@
       showTrans("翻译中…（再试一次）", true);
       return new Promise(function (res) { setTimeout(res, 2500); })
         .then(function () { return translateOnce(text); });
-    }).then(function (out) {
+    }).then(function (j) {
+      var out;
+      if (j.is_word) {
+        // 单词：释义 + 例句（带译文）+ 所在原句（带译文），分块展示
+        var def = cleanTrans(String(j.text || "").split(/\n+/)[0] || "");
+        popState.extra = { def: def, example: j.example || "", exampleZh: j.example_zh || "", sentenceZh: j.sentence_zh || "" };
+        out = def;
+        if (j.example) out += "\n例句：" + j.example + (j.example_zh ? "\n" + j.example_zh : "");
+        if (popState.sentence) out += "\n原句：" + popState.sentence + (j.sentence_zh ? "\n" + j.sentence_zh : "");
+      } else {
+        popState.extra = null;
+        out = cleanTrans(j.text);
+      }
       showTrans(out, false);
+      popState.trans = out;
       return out;
     }).catch(function (e) {
       showTrans("翻译没成功：" + e.message, false);
@@ -770,11 +783,17 @@
     });
   }
   function saveVocab(text, translation, fill) {
+    var ex = popState.extra || {};
     return api("/api/vocab", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({
         word: text.slice(0, 60), book: BID, cfi: "pdf:p" + activePage(),
-        sentence: (popState.sentence || text).slice(0, 300), translation: translation || "", src: "pdf", fill: !!fill
+        sentence: (popState.sentence || text).slice(0, 300),
+        translation: ex.def || translation || "",
+        sentence_zh: ex.sentenceZh || "",
+        example: ex.example || "",
+        example_zh: ex.exampleZh || "",
+        src: "pdf", fill: !!fill
       })
     });
   }
