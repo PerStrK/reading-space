@@ -332,7 +332,7 @@
     return api("/api/translate", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text: text, sentence: popState.sentence || "" })
+      body: JSON.stringify({ text: text, sentence: popState.sentence || "", book: BID })
     }).then(function (j) {
       if (!j.ok) throw new Error(j.hint || j.error || "翻译失败");
       return j;

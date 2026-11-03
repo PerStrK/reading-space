@@ -206,8 +206,25 @@ def main():
         if not text:
             continue
         targets = target_words(text, common)
-        done_words = {r[0] for r in conn.execute(
-            "SELECT word FROM book_words WHERE book = ?", (book,)).fetchall()}
+        # A word counts as done only when its store entry is complete
+        # (senses carrying examples). Hollow entries seeded from the
+        # translation cache (definition only) are reprocessed below and
+        # completed, instead of being skipped forever.
+        done_words = set()
+        for (w,) in conn.execute(
+                "SELECT DISTINCT word FROM book_words WHERE book = ?", (book,)).fetchall():
+            srow = conn.execute("SELECT senses FROM word_store WHERE word = ?",
+                                (w,)).fetchone()
+            ok = False
+            if srow and srow[0]:
+                try:
+                    ok = any((s.get("ex_en") or "").strip()
+                             for s in (json.loads(srow[0]) or [])
+                             if isinstance(s, dict))
+                except Exception:
+                    ok = False
+            if ok:
+                done_words.add(w)
         todo = [w for w in targets if w not in done_words]
         conn.execute(
             "INSERT OR REPLACE INTO book_prewarm (book, total, done, status, updated_at) VALUES (?,?,?,?,?)",

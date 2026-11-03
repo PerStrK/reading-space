@@ -756,6 +756,26 @@ def main():
                         (h, accent, data, int(time.time() * 1000)))
                 made += 1
                 done.append(f"audio {accent} {s[:24]}")
+    # 6) global sentence library: translate queued context sentences
+    #    with FREE models only (word lookups never wait on these; the
+    #    translations also land in the zh5 cache for other lookups)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS sentence_lib (hash TEXT PRIMARY KEY, "
+            "text TEXT NOT NULL, zh TEXT NOT NULL DEFAULT '', created_at INTEGER, updated_at INTEGER)")
+        srows = conn.execute(
+            "SELECT hash, text FROM sentence_lib WHERE zh = '' "
+            "AND length(text) BETWEEN 10 AND 300 ORDER BY created_at ASC LIMIT 4").fetchall()
+        for sr in srows:
+            zh = translate_free(conn, sr["text"], False)
+            if zh:
+                with conn:
+                    conn.execute("UPDATE sentence_lib SET zh = ?, updated_at = ? WHERE hash = ?",
+                                 (strip_labels(zh)[:1200], int(time.time() * 1000), sr["hash"]))
+                cache_put(conn, sr["text"], zh, model="enrich-sentences")
+                done.append(f"sentence-lib {sr['text'][:24]}")
+    except Exception as ex:
+        print(f"sentence-lib failed: {ex}", flush=True)
     conn.close()
     print(time.strftime("%F %T"), "done:", "; ".join(done) if done else "nothing pending", flush=True)
 

@@ -650,13 +650,19 @@ async function handleTranslate(request, env, me) {
         }
       }
     } catch (e) {}
-    // 查词时把所在原句也翻出来，前端连原句带译文一起展示
+    // 所在原句：只从句子库/翻译缓存秒取现成译文，查词请求里绝不现调
+    // 模型翻原句（那是之前查 magic 要等几十秒的原因）；没有现成译文的
+    // 记进句子库排队，后台用免费模型补译，下次遇到就有了。
     const sentence = String(b.sentence || "").trim().slice(0, 400);
     if (sentence && sentence !== text) {
       try {
-        const sr = await translateCore(env, me, sentence);
-        if (sr.ok) out.sentence_zh = sr.text;
-      } catch (e) { /* 原句翻译拿不到，不影响单词本身 */ }
+        const szh = await sentenceZhFromLib(env, sentence);
+        if (szh) out.sentence_zh = szh;
+        await recordSentenceLib(env, {
+          text: sentence, zh: szh || "", book: String(b.book || ""),
+          word: isSingleWord(text) ? normWord(text) : "", user: me && me.user,
+        });
+      } catch (e) { /* 句子库记录失败不影响单词本身 */ }
     }
   }
   return json(out);
@@ -666,14 +672,9 @@ async function handleTranslate(request, env, me) {
    返回 { ok, text, ipa, cached } 或 { ok:false, status, error, hint }。 */
 async function translateCore(env, me, text) {
   const isWord = isSingleWord(text);
-  // 版本前缀：zh5 起单词例句要带中文翻译，旧缓存自动失效
-  const hash = await sha256hex("zh5|" + text);
-  const hit = await env.DB.prepare("SELECT dst FROM translations WHERE hash = ?").bind(hash).first();
-  if (hit && hit.dst) {
-    await recordSentence(env, me, text, hit.dst);
-    return { ok: true, text: hit.dst, ipa: pickIpa(hit.dst), cached: true };
-  }
-  // 全局单词库：别的账户/预热已经查过的词，直接拼装返回，不再问模型
+  // 单词先查全局单词库（预热与他人查过的标准词条）：命中直接拼装
+  // 返回，秒出，不等翻译缓存、更不调模型（用户 2026-11-03 定的顺序：
+  // 单词库 → 翻译缓存 → DeepSeek）。
   if (isWord && env.DB) {
     try {
       await ensureWordStore(env);
@@ -685,6 +686,13 @@ async function translateCore(env, me, text) {
         return { ok: true, text: joined, ipa: pickIpa(joined), cached: true };
       }
     } catch (e) {}
+  }
+  // 版本前缀：zh5 起单词例句要带中文翻译，旧缓存自动失效
+  const hash = await sha256hex("zh5|" + text);
+  const hit = await env.DB.prepare("SELECT dst FROM translations WHERE hash = ?").bind(hash).first();
+  if (hit && hit.dst) {
+    await recordSentence(env, me, text, hit.dst);
+    return { ok: true, text: hit.dst, ipa: pickIpa(hit.dst), cached: true };
   }
 
   // 主模型出不来可用结果（空、报错、把思考过程当答案）就换备用模型再试
@@ -1392,6 +1400,55 @@ async function ensureSentences(env) {
   _sentOk = true;
 }
 
+/* 全局句子库（2026-11-03 新建）：划词时遇到的原句统一收进这里，
+   内容（原句+译文）只存一份，另以 sentence_refs 记关联（哪本书、
+   查哪个词时遇到、谁遇到的、几次）。查词请求永不现翻原句：有现成
+   译文就秒带回去，没有就先记下排队，后台用免费模型补译。 */
+let _libOk = false;
+async function ensureSentenceLib(env) {
+  if (_libOk || !env.DB) return;
+  try {
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS sentence_lib (hash TEXT PRIMARY KEY, text TEXT NOT NULL, " +
+      "zh TEXT NOT NULL DEFAULT '', created_at INTEGER, updated_at INTEGER)"
+    ).run();
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS sentence_refs (hash TEXT NOT NULL, book TEXT NOT NULL DEFAULT '', " +
+      "word TEXT NOT NULL DEFAULT '', user TEXT NOT NULL DEFAULT '', first_at INTEGER, last_at INTEGER, " +
+      "hits INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (hash, book, word, user))"
+    ).run();
+    await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_sentence_refs_book ON sentence_refs(book, last_at DESC)").run();
+  } catch (e) {}
+  _libOk = true;
+}
+
+async function sentenceZhFromLib(env, sentence) {
+  await ensureSentenceLib(env);
+  const h = await sha256hex(sentence);
+  const row = await env.DB.prepare("SELECT zh FROM sentence_lib WHERE hash = ?").bind(h).first();
+  if (row && row.zh) return row.zh;
+  const th = await sha256hex("zh5|" + sentence);
+  const hit = await env.DB.prepare("SELECT dst FROM translations WHERE hash = ?").bind(th).first();
+  return hit && hit.dst ? hit.dst : "";
+}
+
+async function recordSentenceLib(env, o) {
+  await ensureSentenceLib(env);
+  const text = String(o.text || "").trim();
+  if (!text || isSingleWord(text)) return;
+  const h = await sha256hex(text);
+  const now = Date.now();
+  await env.DB.prepare(
+    "INSERT INTO sentence_lib (hash, text, zh, created_at, updated_at) VALUES (?,?,?,?,?) " +
+    "ON CONFLICT(hash) DO UPDATE SET zh = CASE WHEN sentence_lib.zh = '' THEN excluded.zh ELSE sentence_lib.zh END, " +
+    "updated_at = excluded.updated_at"
+  ).bind(h, text.slice(0, 600), String(o.zh || "").slice(0, 1200), now, now).run();
+  await env.DB.prepare(
+    "INSERT INTO sentence_refs (hash, book, word, user, first_at, last_at, hits) VALUES (?,?,?,?,?,?,1) " +
+    "ON CONFLICT(hash, book, word, user) DO UPDATE SET last_at = excluded.last_at, hits = sentence_refs.hits + 1"
+  ).bind(h, String(o.book || "").slice(0, 64), String(o.word || "").slice(0, 80), String(o.user || "").slice(0, 40), now, now).run();
+}
+
 async function recordSentence(env, me, src, dst) {
   // 整句/整段翻译自动进「句子表」：按账号存原句+译文；同一句再翻只更新译文，不挪位置。
   // 失败绝不影响翻译本身，所以全程吞掉异常。
@@ -1404,6 +1461,7 @@ async function recordSentence(env, me, src, dst) {
       "INSERT INTO sentences (user, src, dst, book, first_at, last_at) VALUES (?,?,?,'',?,?) " +
       "ON CONFLICT(user, src) DO UPDATE SET dst = excluded.dst, last_at = excluded.last_at"
     ).bind(me.user, String(src).slice(0, 600), String(dst).slice(0, 1200), now, now).run();
+    await recordSentenceLib(env, { text: src, zh: dst, user: me.user });
   } catch (e) {}
 }
 

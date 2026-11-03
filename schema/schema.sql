@@ -214,3 +214,16 @@ CREATE TABLE IF NOT EXISTS user_books (
 );
 
 CREATE INDEX IF NOT EXISTS idx_user_books_book ON user_books(book_id);
+
+-- Global sentence library (2026-11-03): context sentences collected at
+-- word-lookup time; content stored once, associations in sentence_refs.
+CREATE TABLE IF NOT EXISTS sentence_lib (
+  hash TEXT PRIMARY KEY, text TEXT NOT NULL, zh TEXT NOT NULL DEFAULT '',
+  created_at INTEGER, updated_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS sentence_refs (
+  hash TEXT NOT NULL, book TEXT NOT NULL DEFAULT '', word TEXT NOT NULL DEFAULT '',
+  user TEXT NOT NULL DEFAULT '', first_at INTEGER, last_at INTEGER,
+  hits INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (hash, book, word, user)
+);
+CREATE INDEX IF NOT EXISTS idx_sentence_refs_book ON sentence_refs(book, last_at DESC);
