@@ -57,6 +57,12 @@
 .vw .sent{margin:9px 0 0; font-size:13.5px; line-height:1.6; color:#4c463c; background:#f7f1e3;
   border-left:3px solid #d9c58f; border-radius:0 8px 8px 0; padding:8px 12px}
 .vw .sent b{color:var(--gold); font-weight:600; margin-right:4px}
+.vw .ctx{margin-top:2px}
+.vw .sent .from{color:var(--muted); font-size:12.5px; white-space:nowrap}
+.vw .auds{margin-left:8px; white-space:nowrap}
+.vw .aud{border:1px solid #d9c58f; background:#fffdf6; color:#7a6420; border-radius:999px;
+  font-size:12px; padding:2px 9px; margin-right:5px; cursor:pointer}
+.vw .aud:active{transform:scale(.96)}
 .vw .note{margin-top:7px; font-size:13px; color:var(--muted)}
 .vw .meta{margin-top:9px; font-size:12px; color:var(--muted); display:flex; gap:14px; flex-wrap:wrap}
 .empty{margin-top:30px; text-align:center; color:var(--muted); font-size:14.5px; line-height:2;
@@ -174,25 +180,45 @@ async function load() {
            : "这个账号还没有收过生词。") + "</div>";
     return;
   }
+  const ctxBlock = (c) => {
+    const aud = (c.audio_uk || c.audio_us)
+      ? '<span class="auds">' +
+        (c.audio_uk ? '<button class="aud" data-h="' + esc(c.h) + '" data-a="uk">🔊 英读</button>' : "") +
+        (c.audio_us ? '<button class="aud" data-h="' + esc(c.h) + '" data-a="us">🔊 美读</button>' : "") +
+        "</span>"
+      : "";
+    return '<div class="ctx">' +
+      '<p class="sent"><b>原句</b>' + esc(c.sentence) + aud +
+      (c.book_title ? '<span class="from">——《' + esc(c.book_title) + "》</span>" : "") + "</p>" +
+      (c.sentence_zh ? '<p class="sent"><b>原句翻译</b>' + esc(c.sentence_zh) + "</p>" : "") +
+      "</div>";
+  };
   const card = (it) => {
     const body = trBody(it);
     const mst = it.mastered
       ? '<button class="mst" data-w="' + esc(it.word) + '" data-b="' + esc(it.book) + '" data-m="0">↩ 搬回需复习</button>'
       : '<button class="mst" data-w="' + esc(it.word) + '" data-b="' + esc(it.book) + '" data-m="1">✓ 标记已掌握</button>';
+    const ipas = (it.uk_ipa || it.us_ipa)
+      ? '<span class="ipa">' +
+        (it.uk_ipa ? "英 " + esc(it.uk_ipa) : "") +
+        (it.uk_ipa && it.us_ipa ? " · " : "") +
+        (it.us_ipa ? "美 " + esc(it.us_ipa) : "") + "</span>"
+      : (it.ipa ? '<span class="ipa">' + esc(it.ipa) + "</span>" : "");
+    const ctxs = (it.contexts || []).map(ctxBlock).join("");
     return '<article class="vw' + (it.mastered ? " done" : "") + '">' +
       '<div class="vw-head"><span class="w">' + esc(it.word) + "</span>" +
-      (it.ipa ? '<span class="ipa">' + esc(it.ipa) + "</span>" : "") +
+      ipas +
       (own ? '<span class="ops">' + mst +
              '<button class="del" data-w="' + esc(it.word) + '" data-b="' + esc(it.book) + '">删除</button></span>' : "") +
       "</div>" +
       (body ? '<div class="tr">' + esc(body) + "</div>"
             : '<div class="tr empty">（暂无译文，下次在书里点到它会自动补上）</div>') +
-      (it.sentence ? '<p class="sent"><b>原句</b>' + esc(it.sentence) + "</p>" : "") +
-      (it.sentence_zh ? '<p class="sent"><b>原句翻译</b>' + esc(it.sentence_zh) + "</p>" : "") +
+      (ctxs || (it.sentence ? '<p class="sent"><b>原句</b>' + esc(it.sentence) + "</p>" : "") +
+      (it.sentence_zh ? '<p class="sent"><b>原句翻译</b>' + esc(it.sentence_zh) + "</p>" : "")) +
       (it.example ? '<p class="sent"><b>例句</b>' + esc(it.example) + "</p>" : "") +
       (it.example_zh ? '<p class="sent"><b>例句翻译</b>' + esc(it.example_zh) + "</p>" : "") +
       (it.note ? '<div class="note">备注：' + esc(it.note) + "</div>" : "") +
-      '<div class="meta"><span>📖 ' + esc(it.book) + "</span>" +
+      '<div class="meta"><span>📖 ' + esc(it.book_title || it.book) + "</span>" +
       (it.first_at ? "<span>加入于 " + fmtDay(it.first_at) + "</span>" : "") +
       (it.hits > 1 ? "<span>划过 " + it.hits + " 次</span>" : "") +
       "</div></article>";
@@ -203,6 +229,18 @@ async function load() {
     html += '<h2 class="sechead">✅ 已掌握<span class="cnt2">' + done.length + " 个</span></h2>" + done.map(card).join("");
   }
   $("vlist").innerHTML = html;
+  // 原句录音（后台生成好才有按钮）：一个播放器轮着用，点别的自动切
+  $("vlist").querySelectorAll(".aud").forEach((b) => {
+    b.onclick = () => {
+      const url = "/api/sent-audio?h=" + encodeURIComponent(b.dataset.h) + "&a=" + b.dataset.a;
+      if (!window._aud) window._aud = new Audio();
+      const au = window._aud;
+      if (au.dataset.cur === url && !au.paused) { au.pause(); return; }
+      au.dataset.cur = url;
+      au.src = url;
+      au.play().catch(() => {});
+    };
+  });
   if (own) {
     $("vlist").querySelectorAll(".mst").forEach((b) => {
       b.onclick = async () => {

@@ -106,6 +106,7 @@ export default {
       if (request.method === "DELETE") return delSentence(url, env, me);
       return listSentences(url, env, me);
     }
+    if (path === "/api/sent-audio") return serveSentAudio(url, env, me);
     if (path === "/api/sentences/users") return listSentenceUsers(env, me);
 
     // ---- 账号偏好（按账号分开存）----
@@ -735,6 +736,8 @@ async function ensureVocabCols(env) {
     ["sentence_zh", "TEXT"],
     ["example", "TEXT"],
     ["example_zh", "TEXT"],
+    ["uk_ipa", "TEXT"],
+    ["us_ipa", "TEXT"],
   ];
   for (const [col, type] of want) {
     try { await env.DB.prepare("SELECT " + col + " FROM vocab LIMIT 1").all(); }
@@ -743,6 +746,39 @@ async function ensureVocabCols(env) {
     }
   }
   _vocabColsOk = true;
+}
+
+let _vocabTablesOk = false;
+async function ensureVocabTables(env) {
+  // vocab_contexts：一个生词在多处被划到时，每个原句各存一行（带书名与译文）。
+  // sentence_audio：原句的英/美两版录音，后台慢慢生成，按句子哈希共享。
+  if (_vocabTablesOk || !env.DB) return;
+  try {
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS vocab_contexts (" +
+      "user TEXT NOT NULL, word TEXT NOT NULL, book TEXT NOT NULL, sentence TEXT NOT NULL, " +
+      "sentence_zh TEXT, first_at INTEGER, last_at INTEGER, hits INTEGER NOT NULL DEFAULT 1, " +
+      "PRIMARY KEY (user, word, book, sentence))"
+    ).run();
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS sentence_audio (" +
+      "hash TEXT NOT NULL, accent TEXT NOT NULL, data BLOB NOT NULL, created_at INTEGER, " +
+      "PRIMARY KEY (hash, accent))"
+    ).run();
+  } catch (e) {}
+  _vocabTablesOk = true;
+}
+
+async function serveSentAudio(url, env, me) {
+  const h = String(url.searchParams.get("h") || "");
+  const a = String(url.searchParams.get("a") || "");
+  if (!/^[0-9a-f]{64}$/.test(h) || (a !== "uk" && a !== "us")) return new Response("not found", { status: 404 });
+  await ensureVocabTables(env);
+  const row = await env.DB.prepare("SELECT data FROM sentence_audio WHERE hash = ? AND accent = ?").bind(h, a).first();
+  if (!row || !row.data) return new Response("not found", { status: 404 });
+  return new Response(blobBytes(row.data), {
+    headers: { "content-type": "audio/mpeg", "cache-control": "private, max-age=31536000, immutable" },
+  });
 }
 
 let _ubColsOk = false;
@@ -847,6 +883,19 @@ async function addVocab(request, env, me) {
     now, now, String(b.src || "reading").slice(0, 20),
     sentenceZh, example, exampleZh
   ).run();
+  // 原句单独存一份到 contexts：同一词在不同句子里被划到时，新句子追加进来，
+  // 各自带书名与译文，不再被 vocab 行里的单个 sentence 字段顶掉。
+  await ensureVocabTables(env);
+  const ctxSentence = String(b.sentence || "").slice(0, 400);
+  if (ctxSentence) {
+    await env.DB.prepare(
+      "INSERT INTO vocab_contexts (user, word, book, sentence, sentence_zh, first_at, last_at, hits) " +
+      "VALUES (?,?,?,?,?,?,?,1) " +
+      "ON CONFLICT(user, word, book, sentence) DO UPDATE SET " +
+      "hits = vocab_contexts.hits + 1, last_at = excluded.last_at, " +
+      "sentence_zh = COALESCE(NULLIF(excluded.sentence_zh,''), vocab_contexts.sentence_zh)"
+    ).bind(me.user, word, book, ctxSentence, sentenceZh, now, now).run();
+  }
   const row = await env.DB.prepare(
     "SELECT word, book, hits, translation FROM vocab WHERE user = ? AND word = ? AND book = ?"
   ).bind(me.user, word, book).first();
@@ -859,13 +908,46 @@ async function listVocab(url, env, me) {
   const target = me.role === "admin" && asUser ? asUser : me.user;
   const book = String(url.searchParams.get("book") || "").slice(0, 60);
   await ensureVocabCols(env);
-  const cols = "SELECT word, book, cfi, sentence, translation, note, hits, first_at, last_at, src, mastered, mastered_at, sentence_zh, example, example_zh FROM vocab WHERE user = ?";
+  const cols = "SELECT word, book, cfi, sentence, translation, note, hits, first_at, last_at, src, mastered, mastered_at, sentence_zh, example, example_zh, uk_ipa, us_ipa FROM vocab WHERE user = ?";
   // 按加入顺序排：新加入的在最前（first_at 倒序，老数据没有 first_at 时退回 last_at）
   const ord = " ORDER BY COALESCE(first_at, last_at) DESC, last_at DESC";
   const r = book
     ? await env.DB.prepare(cols + " AND book = ?" + ord).bind(target, book).all()
     : await env.DB.prepare(cols + ord).bind(target).all();
-  const items = (r.results || []).map((it) => ({ ...it, ipa: pickIpa(it.translation || "") }));
+  // 附上全部原句（contexts）：书名解析成书名文本，录音有无一并带出
+  await ensureVocabTables(env);
+  const titles = {};
+  try {
+    const br = await env.DB.prepare("SELECT id, title FROM books").all();
+    for (const b2 of br.results || []) titles[b2.id] = b2.title || b2.id;
+  } catch (e) {}
+  const audioSet = new Set();
+  try {
+    const ar = await env.DB.prepare("SELECT hash, accent FROM sentence_audio").all();
+    for (const a2 of ar.results || []) audioSet.add(a2.hash + "|" + a2.accent);
+  } catch (e) {}
+  const ctxMap = new Map();
+  try {
+    const cr = await env.DB.prepare(
+      "SELECT word, book, sentence, sentence_zh FROM vocab_contexts WHERE user = ? ORDER BY first_at ASC"
+    ).bind(target).all();
+    for (const c of cr.results || []) {
+      const h = await sha256hex(c.sentence);
+      const key = c.word + "\n" + c.book;
+      if (!ctxMap.has(key)) ctxMap.set(key, []);
+      ctxMap.get(key).push({
+        sentence: c.sentence, sentence_zh: c.sentence_zh || "",
+        book: c.book, book_title: titles[c.book] || "",
+        h, audio_uk: audioSet.has(h + "|uk"), audio_us: audioSet.has(h + "|us"),
+      });
+    }
+  } catch (e) {}
+  const items = (r.results || []).map((it) => ({
+    ...it,
+    ipa: pickIpa(it.translation || ""),
+    book_title: titles[it.book] || "",
+    contexts: ctxMap.get(it.word + "\n" + it.book) || [],
+  }));
   return json({ items, user: target, self: me.user, role: me.role });
 }
 
@@ -938,8 +1020,10 @@ async function delVocab(url, env, me) {
   if (!word) return json({ ok: false, error: "missing word" }, 400);
   if (book) {
     await env.DB.prepare("DELETE FROM vocab WHERE user = ? AND word = ? AND book = ?").bind(me.user, word, book).run();
+    await env.DB.prepare("DELETE FROM vocab_contexts WHERE user = ? AND word = ? AND book = ?").bind(me.user, word, book).run();
   } else {
     await env.DB.prepare("DELETE FROM vocab WHERE user = ? AND word = ?").bind(me.user, word).run();
+    await env.DB.prepare("DELETE FROM vocab_contexts WHERE user = ? AND word = ?").bind(me.user, word).run();
   }
   return json({ ok: true });
 }

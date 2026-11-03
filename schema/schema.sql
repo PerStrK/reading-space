@@ -66,10 +66,34 @@ CREATE TABLE IF NOT EXISTS vocab (
   sentence_zh TEXT,                  -- 原句的中文翻译
   example     TEXT,                  -- 词典例句（英文）
   example_zh  TEXT,                  -- 例句的中文翻译
+  uk_ipa      TEXT,                  -- 英式音标（后台补全）
+  us_ipa      TEXT                   -- 美式音标（后台补全）
   PRIMARY KEY (user, word, book)
 );
 
 CREATE INDEX IF NOT EXISTS idx_vocab_last ON vocab(user, last_at DESC);
+
+-- 生词的全部原句：同一词在不同句子/书里被划到时各存一行，带各自译文
+CREATE TABLE IF NOT EXISTS vocab_contexts (
+  user        TEXT NOT NULL,
+  word        TEXT NOT NULL,
+  book        TEXT NOT NULL,
+  sentence    TEXT NOT NULL,         -- 原句
+  sentence_zh TEXT,                  -- 原句翻译
+  first_at    INTEGER,
+  last_at     INTEGER,
+  hits        INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (user, word, book, sentence)
+);
+
+-- 原句录音：英/美两版，按句子 sha256 哈希共享，后台用 TTS 慢慢生成
+CREATE TABLE IF NOT EXISTS sentence_audio (
+  hash       TEXT NOT NULL,          -- sha256(原句)
+  accent     TEXT NOT NULL,          -- uk | us
+  data       BLOB NOT NULL,          -- mp3
+  created_at INTEGER,
+  PRIMARY KEY (hash, accent)
+);
 
 -- 句子表：整句/整段翻译时自动收进来的原句+译文，按账号分开
 -- （老库没有这两列/这张表也没关系：worker 首次用到时会自动补建，见 ensureVocabCols / ensureSentences）
