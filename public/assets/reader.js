@@ -350,8 +350,18 @@
       if (j.is_word) {
         // 单词：释义 + 例句（带译文）+ 所在原句（带译文），分块展示
         var def = cleanTrans(String(j.text || "").split(/\n+/)[0] || "");
-        popState.extra = { def: def, example: j.example || "", exampleZh: j.example_zh || "", sentenceZh: j.sentence_zh || "" };
-        out = def;
+        popState.extra = { def: def, example: j.example || "", exampleZh: j.example_zh || "", sentenceZh: j.sentence_zh || "",
+          ukIpa: j.uk_ipa || "", usIpa: j.us_ipa || "", senses: (j.senses && j.senses.length) ? j.senses : null };
+        if (popState.extra.senses) {
+          var ipaLine = "";
+          if (j.uk_ipa && j.us_ipa) ipaLine = "英 " + j.uk_ipa + " · 美 " + j.us_ipa;
+          else if (j.uk_ipa || j.us_ipa) ipaLine = j.uk_ipa || j.us_ipa;
+          out = (ipaLine ? ipaLine + "\n" : "") + popState.extra.senses.map(function (s) {
+            return ((s.pos ? s.pos + " " : "") + (s.zh || "")).trim();
+          }).join("\n");
+        } else {
+          out = def;
+        }
         if (j.example) out += "\n例句：" + j.example + (j.example_zh ? "\n" + j.example_zh : "");
         if (popState.sentence) out += "\n原句：" + popState.sentence + (j.sentence_zh ? "\n" + j.sentence_zh : "");
       } else {
@@ -382,6 +392,9 @@
         example: ex.example || "",
         example_zh: ex.exampleZh || "",
         src: "reading",
+        uk_ipa: ex.ukIpa || "",
+        us_ipa: ex.usIpa || "",
+        senses: ex.senses || null,
         fill: !!fill
       })
     });

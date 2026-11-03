@@ -194,7 +194,9 @@ async function load() {
       "</div>";
   };
   const card = (it) => {
-    const body = trBody(it);
+    const body = (it.senses && it.senses.length)
+      ? it.senses.map((s) => ((s.pos ? s.pos + " " : "") + (s.zh || "")).trim()).filter(Boolean).join("\n")
+      : trBody(it);
     const mst = it.mastered
       ? '<button class="mst" data-w="' + esc(it.word) + '" data-b="' + esc(it.book) + '" data-m="0">↩ 搬回需复习</button>'
       : '<button class="mst" data-w="' + esc(it.word) + '" data-b="' + esc(it.book) + '" data-m="1">✓ 标记已掌握</button>';

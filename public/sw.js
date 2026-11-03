@@ -2,7 +2,7 @@
    策略：页面外壳 / 静态资源 / 封面 / 书文件用「先出缓存、后台更新」（stale-while-revalidate）；
    /books.json 网络优先（保证书架数据新鲜），断网时回退缓存；/api/ 一律不缓存。
    缓存的都是当前登录用户自己的内容，存在自己浏览器里；登录跳转（/login）永不写入缓存。 */
-const VERSION = "rs-v8";
+const VERSION = "rs-v9";
 const PRECACHE = [
   "/library", "/reader", "/pdf", "/vocab", "/sentences", "/upload",
   "/assets/site.css", "/assets/library.js", "/assets/account.js",

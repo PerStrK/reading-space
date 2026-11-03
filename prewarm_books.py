@@ -36,10 +36,10 @@ TIMEBOX_S = 400
 DDL = [
     "CREATE TABLE IF NOT EXISTS word_store ("
     "word TEXT PRIMARY KEY, def TEXT, example TEXT, example_zh TEXT, "
-    "uk_ipa TEXT, us_ipa TEXT, updated_at INTEGER)",
+    "uk_ipa TEXT, us_ipa TEXT, senses TEXT, updated_at INTEGER)",
     "CREATE TABLE IF NOT EXISTS book_words ("
     "book TEXT NOT NULL, word TEXT NOT NULL, sentence TEXT, "
-    "PRIMARY KEY (book, word))",
+    "PRIMARY KEY (book, word, sentence))",
     "CREATE TABLE IF NOT EXISTS book_prewarm ("
     "book TEXT PRIMARY KEY, total INTEGER, done INTEGER, status TEXT, updated_at INTEGER)",
 ]
@@ -118,11 +118,21 @@ def target_words(text, common):
 
 
 def first_sentence(sentences, word):
+    got = first_sentences(sentences, word, 1)
+    return got[0] if got else ""
+
+
+def first_sentences(sentences, word, limit=3):
+    """Up to `limit` distinct sentences containing the word (the cache
+    library keeps several contexts per word, each translated)."""
     pat = re.compile(r"\b" + re.escape(word) + r"(?:'s)?\b", re.I)
+    out = []
     for s in sentences:
-        if pat.search(s):
-            return s
-    return ""
+        if pat.search(s) and s not in out:
+            out.append(s)
+            if len(out) >= limit:
+                break
+    return out
 
 
 def seed_store_from_text(conn, word, text3):
@@ -156,6 +166,18 @@ def main():
     conn.row_factory = sqlite3.Row
     for ddl in DDL:
         conn.execute(ddl)
+    try:
+        conn.execute("ALTER TABLE word_store ADD COLUMN senses TEXT")
+    except Exception:
+        pass
+    # book_words used to key one sentence per (book, word); the cache now
+    # keeps up to 3 sentences per word, so the PK grew a sentence column.
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'book_words'").fetchone()
+    if row and "PRIMARY KEY (book, word))" in (row[0] or ""):
+        conn.execute("ALTER TABLE book_words RENAME TO book_words_mig")
+        conn.execute(DDL[1])
+        conn.execute("INSERT OR IGNORE INTO book_words (book, word, sentence) SELECT book, word, sentence FROM book_words_mig")
+        conn.execute("DROP TABLE book_words_mig")
     conn.commit()
     common = top800()
     started = time.time()
@@ -194,30 +216,41 @@ def main():
         for w in todo:
             if time.time() - started > TIMEBOX_S:
                 break
-            # Words whose def and sentence translation are both already
-            # cached cost no model call: they do not eat the batch budget.
+            # Prewarm is FREE-MODELS-ONLY (user rule): every lookup below
+            # goes through E.word_entry_free / E.translate_free, which
+            # never touch the paid fallback.
             store = conn.execute("SELECT def FROM word_store WHERE word = ?", (w,)).fetchone()
-            sent = first_sentence(sentences, w)
-            costly = not (store and store["def"]) or (sent and not E.cached(conn, sent))
+            sents = first_sentences(sentences, w, 3)
+            uncached = [s for s in sents if not E.cached(conn, s)]
+            costly = not (store and store["def"]) or bool(uncached)
             if costly and budget[0] <= 0:
                 break
             if costly:
                 budget[0] -= 1
             if not (store and store["def"]):
-                cached = E.cached(conn, w)
-                if cached:
-                    seed_store_from_text(conn, w, cached)
-                else:
-                    out = E.translate(conn, w, True, timeout=20)
-                    if out:
-                        seed_store_from_text(conn, w, out)
-            if sent and not E.cached(conn, sent):
-                E.translate(conn, sent, False, timeout=20)
+                entry, _used = E.word_entry_free(conn, w, timeout=20)
+                if entry:
+                    E.seed_store_full(conn, w, entry)
+                    if not entry.get("us_ipa"):
+                        pair = E.ipa_from_structured(E.STRICT_FREE_MODEL, w, timeout=20) \
+                            or E.ipa_from_structured(E.STRICT_FREE_MODEL2, w, timeout=20)
+                        if pair:
+                            with conn:
+                                conn.execute(
+                                    "UPDATE word_store SET uk_ipa = COALESCE(NULLIF(uk_ipa,''), ?), "
+                                    "us_ipa = COALESCE(NULLIF(us_ipa,''), ?) WHERE word = ?",
+                                    (pair[0], pair[1], w))
+            for s in uncached:
+                E.translate_free(conn, s, False, timeout=20)
+            have = conn.execute("SELECT def FROM word_store WHERE word = ?", (w,)).fetchone()
+            if not (have and have["def"]):
+                continue  # no definition yet; leave the word for a later run
             with conn:
-                conn.execute("INSERT OR IGNORE INTO book_words (book, word, sentence) VALUES (?,?,?)",
-                             (book, w, sent))
+                for s in (sents or [""]):
+                    conn.execute("INSERT OR IGNORE INTO book_words (book, word, sentence) VALUES (?,?,?)",
+                                 (book, w, s))
             made += 1
-        done_now = conn.execute("SELECT COUNT(*) FROM book_words WHERE book = ?",
+        done_now = conn.execute("SELECT COUNT(DISTINCT word) FROM book_words WHERE book = ?",
                                 (book,)).fetchone()[0]
         status = "complete" if done_now >= len(targets) else "running"
         conn.execute("UPDATE book_prewarm SET done = ?, status = ?, updated_at = ? WHERE book = ?",

@@ -472,8 +472,10 @@ async function delReadingBookmark(url, env, me) {
 
 /* ---------- 翻译与生词 ---------- */
 
-// 翻译链（2026-11-03 起）：ultra 免费软约束（质量主力）与 dots 免费
-// 严格模板、nano 免费软约束三路对冲，DeepSeek flash 兜底（先严格、后软约束）。
+// 翻译链（2026-11-03 定版，用户规则）：阅读中查词缓存未命中时优先
+// DeepSeek flash（先严格模板、后软约束），免费三路对冲（ultra 软约束、
+// dots 严格模板、nano 软约束）只作兜底；后台预热严格只用免费模型
+// （见 prewarm_books.py / enrich_vocab.py 的 translate_free）。
 const TR_DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
 const TR_FALLBACK_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
 const TR_FALLBACK2_MODEL = "~deepseek/deepseek-flash-latest";
@@ -485,16 +487,19 @@ const TR_FALLBACK2_MODEL = "~deepseek/deepseek-flash-latest";
    失败就当没这回事）。严格版只用在 dots 对冲与 DeepSeek 兜底上，中间仍
    走软约束链。拿到 JSON 后统一拼回现有三行文本，下游缓存/生词本都不用改。 */
 const TR_STRICT_MODEL = "dots-studio/dots-3-note-preview:free";
+/* 单词严格模板用扁平字段：2026-11-03 实测 DeepSeek 的 structured 端点
+   对嵌套数组 schema 一律回空，扁平的 senses_text（"n. 义一；v. 义二"）
+   则稳定返回，拿到后在本地拆成义项数组。 */
 const WORD_SCHEMA = {
   type: "object",
   properties: {
-    ipa: { type: "string", description: "国际音标，两侧带斜杠，如 /ˈmɪərkæt/" },
-    pos: { type: "string", description: "词性缩写，如 n. / v. / adj." },
-    def_zh: { type: "string", description: "中文释义，不超过 40 字" },
+    uk_ipa: { type: "string", description: "英式国际音标，两侧带斜杠，如 /ˈmɪərkæt/" },
+    us_ipa: { type: "string", description: "美式国际音标，两侧带斜杠" },
+    senses_text: { type: "string", description: "最常用的前三个义项，每个义项以词性缩写开头（如 n. / v. / adj.），义项之间用中文分号；分隔，如：n. 魔杖；v. 挥舞" },
     example_en: { type: "string", description: "一句简短英文例句" },
     example_zh: { type: "string", description: "上面例句的中文翻译" },
   },
-  required: ["ipa", "pos", "def_zh", "example_en", "example_zh"],
+  required: ["uk_ipa", "us_ipa", "senses_text", "example_en", "example_zh"],
   additionalProperties: false,
 };
 const PHRASE_SCHEMA = {
@@ -596,6 +601,23 @@ async function handleTranslate(request, env, me) {
     const p = splitWordText(r.text);
     out.example = p.example;
     out.example_zh = p.exampleZh;
+    // 双音标与结构化义项（前三义）从全局单词库附带返回，供阅读器展示
+    try {
+      await ensureWordStore(env);
+      const ws = await env.DB.prepare(
+        "SELECT uk_ipa, us_ipa, senses FROM word_store WHERE word = ?"
+      ).bind(normWord(text)).first();
+      if (ws) {
+        if (ws.uk_ipa) out.uk_ipa = ws.uk_ipa;
+        if (ws.us_ipa) out.us_ipa = ws.us_ipa;
+        if (ws.senses) {
+          try {
+            const ss = JSON.parse(ws.senses);
+            if (Array.isArray(ss) && ss.length) out.senses = ss;
+          } catch (e) {}
+        }
+      }
+    } catch (e) {}
     // 查词时把所在原句也翻出来，前端连原句带译文一起展示
     const sentence = String(b.sentence || "").trim().slice(0, 400);
     if (sentence && sentence !== text) {
@@ -772,15 +794,48 @@ async function translateCore(env, me, text) {
         return t.trim();
       };
       let got = "";
+      let entry = null;
       if (isWord) {
-        let ipa = S(d.ipa).replace(/^\/+|\/+$/g, "").replace(/^[\[\]:\s]+|[\[\]:\s]+$/g, "");
-        const pos = normPos(S(d.pos));
-        const defZh = cleanDef(S(d.def_zh), pos);
+        const slashIpa = (v) => {
+          const t = S(v).replace(/^\/+|\/+$/g, "").replace(/^[\[\]:\s]+|[\[\]:\s]+$/g, "");
+          return t ? "/" + t + "/" : "";
+        };
+        let senses = [];
+        if (typeof d.senses_text === "string" && d.senses_text) {
+          // "n. 义一；闲逛；v. 义二" -> [{pos, zh}...]: a segment starting
+          // with a POS token opens a new sense; bare segments continue
+          // the previous sense's gloss.
+          for (const seg of d.senses_text.split(/[;；]/)) {
+            const t = seg.trim();
+            if (!t) continue;
+            const pm = t.match(/^([A-Za-z]+\.?|名词|动词|形容词|副词|介词|连词|代词|感叹词|数词|冠词)\s+(.+)$/);
+            if (pm && hasZh(pm[2])) {
+              if (senses.length < 3) senses.push({ pos: normPos(pm[1]), zh: cleanDef(pm[2], normPos(pm[1])).slice(0, 60) });
+              else if (senses.length) senses[senses.length - 1].zh += ";" + t;
+            } else if (senses.length && hasZh(t)) {
+              senses[senses.length - 1].zh += ";" + t;
+            } else if (hasZh(t)) {
+              senses.push({ pos: "", zh: t.slice(0, 60) });
+            }
+          }
+        }
+        let ukIpa = slashIpa(d.uk_ipa), usIpa = slashIpa(d.us_ipa);
+        if (!senses.length && d.def_zh) {
+          // tolerate the old single-sense shape
+          const pos = normPos(S(d.pos));
+          const zh = cleanDef(S(d.def_zh), pos);
+          if (zh && hasZh(zh)) senses = [{ pos, zh }];
+          ukIpa = ukIpa || slashIpa(d.ipa);
+          usIpa = usIpa || ukIpa;
+        }
         const ex = S(d.example_en), exZh = S(d.example_zh);
-        if (!ipa || !defZh || !ex || !exZh || !hasZh(defZh) || !hasZh(exZh)) {
+        if (!senses.length || !ukIpa || !ex || !exZh || !hasZh(exZh)) {
           return { kind: "fail", err: "strict invalid fields", model };
         }
-        got = ["/" + ipa + "/", pos, defZh].filter(Boolean).join(" ") + "\n" + ex + "\n" + exZh;
+        entry = { uk_ipa: ukIpa, us_ipa: usIpa, senses, example_en: ex, example_zh: exZh };
+        const defLine = senses.map((s, i) =>
+          (i === 0 ? ukIpa + " " : "") + [s.pos, s.zh].filter(Boolean).join(" ")).join("; ");
+        got = defLine + "\n" + ex + "\n" + exZh;
       } else if (isPhrase) {
         const pos = normPos(S(d.pos));
         const defZh = cleanDef(S(d.def_zh), pos);
@@ -796,17 +851,19 @@ async function translateCore(env, me, text) {
       got = polishTranslation(got);
       if (!usableTranslation(got)) return { kind: "fail", err: "strict unusable", model };
       if (isWord && !pickIpa(got)) return { kind: "fail", err: "strict no ipa", model };
-      return { kind: "clean", text: got, model };
+      return { kind: "clean", text: got, model, entry };
     } catch (e) {
       return { kind: "fail", err: "strict parse", model };
     }
   }
 
+  let cleanEntry = null;
   function absorb(res) {
     if (!res) return;
     if (res.kind === "clean" && !clean) {
       clean = res.text;
       usedModel = res.model;
+      if (res.entry) cleanEntry = res.entry;
     } else if (res.kind === "noipa" && !noIpa) {
       noIpa = res.text;
       noIpaModel = res.model;
@@ -814,6 +871,12 @@ async function translateCore(env, me, text) {
       lastErr = res.err;
     }
   }
+
+  // 阅读中查词、缓存未命中时优先 DeepSeek（用户规则）：先严格模板
+  // （双音标 + 前三义），不成再软约束；DeepSeek 都没出可用结果时，
+  // 才轮到下面的免费三路对冲兜底。
+  absorb(await tryStrictPlan(plans[2].model, 25000));
+  if (!clean) absorb(await tryPlan(plans[2], 25000));
 
   // 免费三路对冲：ultra 软约束（质量主力）→ dots 严格模板 → nano 软约束。
   // 先发第一个；它先结束却没出最终答案就立刻发下一个，6 秒还没结束也把
@@ -823,7 +886,7 @@ async function translateCore(env, me, text) {
     () => tryStrictPlan(env.TRANSLATE_STRICT || TR_STRICT_MODEL, 15000),
     () => tryPlan(plans[1], 25000),
   ];
-  await new Promise((resolve) => {
+  if (!clean) await new Promise((resolve) => {
     const launched = new Set();
     let settled = 0, finished = false;
     const done = () => { if (!finished) { finished = true; resolve(); } };
@@ -846,11 +909,6 @@ async function translateCore(env, me, text) {
     launch(0);
     setTimeout(() => { if (!finished && !clean) { const n = nextIdx(); if (n >= 0) launch(n); } }, 6000);
   });
-  // 免费的都没出最终答案，最后用 DeepSeek 兜底：先严格模板，不成再走软约束
-  if (!clean && plans.length > 2) {
-    absorb(await tryStrictPlan(plans[2].model, 25000));
-    if (!clean) absorb(await tryPlan(plans[2], 25000));
-  }
   if (!clean && noIpa) usedModel = noIpaModel;
   if (!clean) clean = noIpa;             // 音标没要到，至少把释义给出来
   if (!usableTranslation(clean)) {
@@ -861,7 +919,19 @@ async function translateCore(env, me, text) {
     "INSERT OR REPLACE INTO translations (hash, src, dst, model, created_at) VALUES (?,?,?,?,?)"
   ).bind(hash, text.slice(0, 300), clean.slice(0, 1200), usedModel, Date.now()).run();
   if (isWord) {
-    try { await upsertWordStore(env, normWord(text), splitWordText(clean)); } catch (e) {}
+    try {
+      if (cleanEntry) {
+        const parts = splitWordText(clean);
+        await upsertWordStore(env, normWord(text), {
+          def: parts.def, example: cleanEntry.example_en || parts.example,
+          exampleZh: cleanEntry.example_zh || parts.exampleZh,
+          ukIpa: cleanEntry.uk_ipa || "", usIpa: cleanEntry.us_ipa || "",
+          senses: cleanEntry.senses || null,
+        });
+      } else {
+        await upsertWordStore(env, normWord(text), splitWordText(clean));
+      }
+    } catch (e) {}
   }
   await recordSentence(env, me, text, clean);
 
@@ -945,8 +1015,12 @@ async function ensureWordStore(env) {
     await env.DB.prepare(
       "CREATE TABLE IF NOT EXISTS word_store (" +
       "word TEXT PRIMARY KEY, def TEXT, example TEXT, example_zh TEXT, " +
-      "uk_ipa TEXT, us_ipa TEXT, updated_at INTEGER)"
+      "uk_ipa TEXT, us_ipa TEXT, senses TEXT, updated_at INTEGER)"
     ).run();
+    try { await env.DB.prepare("SELECT senses FROM word_store LIMIT 1").all(); }
+    catch (e) {
+      try { await env.DB.prepare("ALTER TABLE word_store ADD COLUMN senses TEXT").run(); } catch (e2) {}
+    }
     await env.DB.prepare(
       "CREATE TABLE IF NOT EXISTS word_audio (" +
       "word TEXT NOT NULL, accent TEXT NOT NULL, data BLOB NOT NULL, created_at INTEGER, " +
@@ -955,7 +1029,7 @@ async function ensureWordStore(env) {
     await env.DB.prepare(
       "CREATE TABLE IF NOT EXISTS book_words (" +
       "book TEXT NOT NULL, word TEXT NOT NULL, sentence TEXT, " +
-      "PRIMARY KEY (book, word))"
+      "PRIMARY KEY (book, word, sentence))"
     ).run();
     await env.DB.prepare(
       "CREATE TABLE IF NOT EXISTS book_prewarm (" +
@@ -969,14 +1043,20 @@ async function upsertWordStore(env, word, p) {
   // 只填空缺：先到先得，不覆盖已有内容
   if (!word || !p || !p.def) return;
   await ensureWordStore(env);
+  const sensesJson = Array.isArray(p.senses) && p.senses.length
+    ? JSON.stringify(p.senses.slice(0, 3)) : "";
   await env.DB.prepare(
-    "INSERT INTO word_store (word, def, example, example_zh, updated_at) VALUES (?,?,?,?,?) " +
+    "INSERT INTO word_store (word, def, example, example_zh, uk_ipa, us_ipa, senses, updated_at) VALUES (?,?,?,?,?,?,?,?) " +
     "ON CONFLICT(word) DO UPDATE SET " +
     "def = COALESCE(NULLIF(word_store.def,''), excluded.def), " +
     "example = COALESCE(NULLIF(word_store.example,''), excluded.example), " +
     "example_zh = COALESCE(NULLIF(word_store.example_zh,''), excluded.example_zh), " +
+    "uk_ipa = COALESCE(NULLIF(word_store.uk_ipa,''), excluded.uk_ipa), " +
+    "us_ipa = COALESCE(NULLIF(word_store.us_ipa,''), excluded.us_ipa), " +
+    "senses = COALESCE(NULLIF(word_store.senses,''), excluded.senses), " +
     "updated_at = excluded.updated_at"
-  ).bind(word, p.def || "", p.example || "", p.exampleZh || "", Date.now()).run();
+  ).bind(word, p.def || "", p.example || "", p.exampleZh || "",
+         p.ukIpa || "", p.usIpa || "", sensesJson, Date.now()).run();
 }
 
 async function serveWordAudio(url, env, me) {
@@ -1126,6 +1206,9 @@ async function addVocab(request, env, me) {
         def: p0.def,
         example: example || p0.example,
         exampleZh: exampleZh || p0.exampleZh,
+        ukIpa: String(b.uk_ipa || "").slice(0, 60),
+        usIpa: String(b.us_ipa || "").slice(0, 60),
+        senses: Array.isArray(b.senses) ? b.senses : null,
       });
     }
   } catch (e) {}
@@ -1179,7 +1262,7 @@ async function listVocab(url, env, me) {
   await ensureWordStore(env);
   const storeMap = new Map();
   try {
-    const sr = await env.DB.prepare("SELECT word, def, example, example_zh, uk_ipa, us_ipa FROM word_store").all();
+    const sr = await env.DB.prepare("SELECT word, def, example, example_zh, uk_ipa, us_ipa, senses FROM word_store").all();
     for (const s of sr.results || []) storeMap.set(s.word, s);
   } catch (e) {}
   const wAudioSet = new Set();
@@ -1196,6 +1279,12 @@ async function listVocab(url, env, me) {
       example_zh: it.example_zh || ws.example_zh || "",
       uk_ipa: ws.uk_ipa || it.uk_ipa || "",
       us_ipa: ws.us_ipa || it.us_ipa || "",
+      senses: (() => {
+        try {
+          const ss = JSON.parse(ws.senses || "null");
+          return Array.isArray(ss) && ss.length ? ss : null;
+        } catch (e) { return null; }
+      })(),
       word_audio_uk: wAudioSet.has(it.word + "|uk"),
       word_audio_us: wAudioSet.has(it.word + "|us"),
     };

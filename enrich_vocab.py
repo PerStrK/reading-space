@@ -68,6 +68,19 @@ IPA_SCHEMA = {"type": "object",
               "required": ["uk_ipa", "us_ipa"],
               "additionalProperties": False}
 
+WORD2_SCHEMA = {"type": "object",
+                "properties": {
+                    "uk_ipa": {"type": "string", "description": "British IPA wrapped in slashes"},
+                    "us_ipa": {"type": "string", "description": "American IPA wrapped in slashes"},
+                    "senses_text": {"type": "string", "description": "Up to 3 most common senses, each starting with a POS abbreviation, separated by Chinese semicolons, e.g. 'n. X;v. Y'"},
+                    "example_en": {"type": "string", "description": "One short English example sentence"},
+                    "example_zh": {"type": "string", "description": "Chinese translation of the example"}},
+                "required": ["uk_ipa", "us_ipa", "senses_text", "example_en", "example_zh"],
+                "additionalProperties": False}
+# NOTE: flat fields on purpose -- DeepSeek's structured endpoint returns
+# empty content for nested-array schemas (verified 2026-11-03), while the
+# flat senses_text form answers reliably; it is split locally.
+
 WORD_SYS = ("英汉词典。只输出三行，不要思考过程、不要步骤、不要 Markdown、不要加粗。"
             "第一行：「/国际音标/ 词性 中文释义」，音标两侧必须加斜杠，例如 /ˈmɪərkæt/ n. 猫鼬；"
             "第二行：一句简短英文例句；第三行：第二行例句的中文翻译。中文释义不超过 40 字。")
@@ -259,6 +272,139 @@ def translate(conn, text, is_word, timeout=45):
     return out
 
 
+def word2_from_structured(model, word, timeout=45):
+    """Strict rich word entry -> validated dict or None. Fields: uk_ipa,
+    us_ipa, senses (<=3 of {pos, zh}), example_en, example_zh."""
+    d = llm_structured(model, "word_entry", WORD2_SCHEMA, word, max_tokens=600, timeout=timeout)
+    if not d:
+        return None
+    senses = []
+    for seg in re.split(r"[;\uFF1B]", str(d.get("senses_text") or "")):
+        t = seg.strip()
+        if not t:
+            continue
+        pm = re.match(r"^([A-Za-z]+\.?|\u540d\u8bcd|\u52a8\u8bcd|\u5f62\u5bb9\u8bcd|\u526f\u8bcd|\u4ecb\u8bcd|\u8fde\u8bcd|\u4ee3\u8bcd|\u611f\u53f9\u8bcd|\u6570\u8bcd|\u51a0\u8bcd)\s+(.+)$", t)
+        if pm and re.search(r"[\u4e00-\u9fff]", pm.group(2)):
+            if len(senses) < 3:
+                senses.append({"pos": _norm_pos(pm.group(1)), "zh": pm.group(2).strip()[:60]})
+            elif senses:
+                senses[-1]["zh"] += ";" + t
+        elif senses and re.search(r"[\u4e00-\u9fff]", t):
+            senses[-1]["zh"] += ";" + t
+        elif re.search(r"[\u4e00-\u9fff]", t):
+            senses.append({"pos": "", "zh": t[:60]})
+    if not senses:
+        return None
+    uk = _slash_ipa(str(d.get("uk_ipa") or ""))
+    us = _slash_ipa(str(d.get("us_ipa") or ""))
+    return {"uk_ipa": uk, "us_ipa": us, "senses": senses,
+            "example_en": str(d.get("example_en") or "").strip(),
+            "example_zh": str(d.get("example_zh") or "").strip()}
+
+
+def compose_def_line(entry):
+    """'/uk ipa/ pos1 zh1; pos2 zh2' from a rich entry (legacy one-line def)."""
+    senses = entry.get("senses") or []
+    if not senses:
+        return ""
+    ipa = entry.get("uk_ipa") or entry.get("us_ipa") or ""
+    parts = []
+    for i, s in enumerate(senses):
+        seg = ((s.get("pos") or "") + " " + (s.get("zh") or "")).strip()
+        if i == 0 and ipa:
+            seg = ipa + " " + seg
+        parts.append(seg)
+    return "; ".join(parts)[:300]
+
+
+def entry_text(entry):
+    """Rich entry -> the legacy three-line text (def / example / example zh)."""
+    lines = [compose_def_line(entry)]
+    if entry.get("example_en"):
+        lines.append(entry["example_en"])
+    if entry.get("example_zh"):
+        lines.append(entry["example_zh"])
+    return "\n".join([l for l in lines if l])
+
+
+def entry_from_text(text):
+    """Legacy three-line text -> single-sense rich entry (best effort)."""
+    lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
+    if not lines:
+        return None
+    first = lines[0]
+    m = re.match(r"^(/[^/]{1,40}/)\s*(.*)$", first)
+    ipa = m.group(1) if m else ""
+    rest = m.group(2) if m else first
+    pm = re.match(r"^([A-Za-z]+\.)\s*(.*)$", rest)
+    pos = _norm_pos(pm.group(1)) if pm else ""
+    zh = pm.group(2) if pm else rest
+    return {"uk_ipa": ipa, "us_ipa": "", "senses": [{"pos": pos, "zh": zh[:60]}],
+            "example_en": lines[1] if len(lines) > 1 else "",
+            "example_zh": lines[2] if len(lines) > 2 else ""}
+
+
+def translate_free(conn, text, is_word, timeout=20):
+    """PREWARM ONLY: free models exclusively, never the paid fallback.
+    dots strict -> super-vl strict -> ultra/nano soft."""
+    hit = cached(conn, text)
+    if hit:
+        return hit
+    strict_fn = word_from_structured if is_word else sent_from_structured
+    out = strict_fn(STRICT_FREE_MODEL, text, timeout=timeout)
+    if not out:
+        out = strict_fn(STRICT_FREE_MODEL2, text, timeout=timeout)
+    if not out:
+        out = llm(WORD_SYS if is_word else SENT_SYS, text,
+                  500 if is_word else 300, timeout=timeout, models=MODELS[:2])
+    if out:
+        cache_put(conn, text, out)
+    return out
+
+
+def word_entry_free(conn, word, timeout=20):
+    """Rich entry for a word using FREE models only (prewarm). Returns
+    (entry, used_llm). Falls back to cached/soft three-line results."""
+    hit = cached(conn, word)
+    if hit:
+        return entry_from_text(hit), False
+    entry = word2_from_structured(STRICT_FREE_MODEL, word, timeout=timeout) \
+        or word2_from_structured(STRICT_FREE_MODEL2, word, timeout=timeout)
+    used = True
+    if entry:
+        cache_put(conn, word, entry_text(entry))
+        return entry, used
+    out = llm(WORD_SYS, word, 500, timeout=timeout, models=MODELS[:2])
+    if out:
+        cache_put(conn, word, out)
+        return entry_from_text(out), used
+    return None, used
+
+
+def seed_store_full(conn, word, entry):
+    """Write a rich entry into word_store, filling only empty fields
+    (senses/ipas are set when present and the stored ones are empty)."""
+    if not entry:
+        return
+    d = compose_def_line(entry)
+    senses_json = json.dumps(entry.get("senses") or [], ensure_ascii=False)
+    conn.execute(
+        "INSERT INTO word_store (word, def, example, example_zh, uk_ipa, us_ipa, senses, updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(word) DO UPDATE SET "
+        "def = COALESCE(NULLIF(word_store.def,''), excluded.def), "
+        "example = COALESCE(NULLIF(word_store.example,''), excluded.example), "
+        "example_zh = COALESCE(NULLIF(word_store.example_zh,''), excluded.example_zh), "
+        "uk_ipa = COALESCE(NULLIF(word_store.uk_ipa,''), excluded.uk_ipa), "
+        "us_ipa = COALESCE(NULLIF(word_store.us_ipa,''), excluded.us_ipa), "
+        "senses = COALESCE(NULLIF(word_store.senses,''), excluded.senses), "
+        "updated_at = excluded.updated_at",
+        (word, d, entry.get("example_en") or "", entry.get("example_zh") or "",
+         entry.get("uk_ipa") or "", entry.get("us_ipa") or "", senses_json,
+         int(time.time() * 1000)))
+    conn.commit()
+
+
 def seed_store(conn, word, d, ex, exzh):
     """Write word content into the global store, filling only empty fields."""
     conn.execute(
@@ -319,7 +465,11 @@ def main():
     conn.execute(
         "CREATE TABLE IF NOT EXISTS word_store ("
         "word TEXT PRIMARY KEY, def TEXT, example TEXT, example_zh TEXT, "
-        "uk_ipa TEXT, us_ipa TEXT, updated_at INTEGER)")
+        "uk_ipa TEXT, us_ipa TEXT, senses TEXT, updated_at INTEGER)")
+    try:
+        conn.execute("ALTER TABLE word_store ADD COLUMN senses TEXT")
+    except Exception:
+        pass
     conn.execute(
         "CREATE TABLE IF NOT EXISTS word_audio ("
         "word TEXT NOT NULL, accent TEXT NOT NULL, data BLOB NOT NULL, created_at INTEGER, "
@@ -398,6 +548,25 @@ def main():
                     seeded = True
         if seeded:
             done.append(f"def {w}")
+
+    # 2b) senses fill: vocab words whose store row lacks the structured
+    #     senses (top-3 with POS). dots strict -> super-vl strict ->
+    #     DeepSeek strict (enrichment serves post-reading entries, where
+    #     the paid fallback is allowed; only prewarm is free-only).
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT v.word FROM vocab v LEFT JOIN word_store s ON s.word = v.word "
+            "WHERE s.senses IS NULL OR s.senses = '' OR s.senses = '[]' LIMIT 2").fetchall()
+        for r in rows:
+            w = r["word"]
+            entry = word2_from_structured(STRICT_FREE_MODEL, w, timeout=20) \
+                or word2_from_structured(STRICT_FREE_MODEL2, w, timeout=20) \
+                or word2_from_structured(MODELS[2], w, timeout=20)
+            if entry:
+                seed_store_full(conn, w, entry)
+                done.append(f"senses {w}")
+    except Exception as ex:
+        print(f"senses job failed: {ex}", flush=True)
 
     # 3) missing context translations
     rows = conn.execute(

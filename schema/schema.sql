@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS word_store (
   example_zh TEXT,                   -- 例句中文翻译
   uk_ipa     TEXT,                   -- 英式音标（后台补全）
   us_ipa     TEXT,                   -- 美式音标（后台补全）
+  senses     TEXT,                   -- 结构化义项 JSON [{pos, zh}]，最常用的前三个
   updated_at INTEGER
 );
 
@@ -115,12 +116,12 @@ CREATE TABLE IF NOT EXISTS word_audio (
   PRIMARY KEY (word, accent)
 );
 
--- 缓存库的书-词索引：上传后后台预热产出（800 常用词之外的词 + 书中第一个原句）
+-- 缓存库的书-词索引：上传后后台预热产出（800 常用词之外的词 + 书中原句，每词最多 3 句）
 CREATE TABLE IF NOT EXISTS book_words (
   book     TEXT NOT NULL,
   word     TEXT NOT NULL,
-  sentence TEXT,                     -- 该词在书里第一次出现的原句（译文查 translations 缓存）
-  PRIMARY KEY (book, word)
+  sentence TEXT,                     -- 该词在书里出现的原句（译文查 translations 缓存）
+  PRIMARY KEY (book, word, sentence)
 );
 
 -- 每本书的预热进度
