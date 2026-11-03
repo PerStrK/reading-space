@@ -495,7 +495,7 @@ const WORD_SCHEMA = {
   properties: {
     uk_ipa: { type: "string", description: "英式国际音标，两侧带斜杠，如 /ˈmɪərkæt/" },
     us_ipa: { type: "string", description: "美式国际音标，两侧带斜杠" },
-    senses_text: { type: "string", description: "最常用的前三个义项，义项之间用中文分号；分隔。每个义项格式：词性缩写 中文义 | 一句简单英文例句（不超过12个常用词，专为该义项而写，不要用书里的原句） | 该例句的中文翻译。如：n. 魔杖 | The witch waves her wand. | 女巫挥舞她的魔杖；v. 挥舞 | He waves his hand. | 他挥了挥手" },
+    senses_text: { type: "string", description: "前三个常用义项，用；分隔。每项：词性缩写 中文义 | 简单英文例句(≤12词) | 例句中译。如：n. 魔杖 | The witch waves her wand. | 女巫挥舞她的魔杖" },
     example_en: { type: "string", description: "第一个义项的例句（与 senses_text 里第一个义项的例句相同）" },
     example_zh: { type: "string", description: "上面例句的中文翻译" },
   },
@@ -553,6 +553,22 @@ function pickIpa(s) {
 /* 单词译文是三行：释义 / 英文例句 / 例句中文翻译，拆开给前端分块展示 */
 function splitWordText(t) {
   const lines = String(t || "").split(/\n+/).map((x) => x.trim()).filter(Boolean);
+  if (!lines.length) return { def: "", example: "", exampleZh: "" };
+  // Models sometimes split the gloss itself across lines (noun senses on
+  // line 1, verb senses on line 2, ...). Blindly taking line 2 as the
+  // example then shifts everything -- the "example" shows a gloss and
+  // the real example lands in the translation slot. Walk the lines:
+  // Chinese gloss lines merge into the definition until the first line
+  // that reads as an English sentence; that line is the example and the
+  // next one its translation.
+  const hasZh = (l) => /[\u4e00-\u9fff]/.test(l);
+  const looksEnSentence = (l) => !hasZh(l) && /[A-Za-z]/.test(l) && l.split(/\s+/).length >= 3;
+  const defParts = [lines[0]];
+  let i = 1;
+  while (i < lines.length && hasZh(lines[i])) { defParts.push(lines[i]); i++; }
+  if (i < lines.length && looksEnSentence(lines[i])) {
+    return { def: defParts.join("\n"), example: lines[i], exampleZh: lines[i + 1] || "" };
+  }
   return { def: lines[0] || "", example: lines[1] || "", exampleZh: lines[2] || "" };
 }
 
@@ -572,8 +588,17 @@ function salvageAnswer(raw) {
   return keep.slice(-2).join("\n");
 }
 
+/* 词典语体标记（〈口〉=口语、〈正式〉、〈俚〉等）是词典编纂符号，
+   模型会原样写进释义（有时还写成 ASCII 的 <口>），对读者没有意义，
+   统一剥掉。只剥短小的尖括号标签，不动正文里的引文与例句。 */
+function stripLabels(s) {
+  return String(s || "")
+    .replace(/[<〈][^>〉\n]{0,4}?(口|正式|俚|俗|方|旧|书面|文言|喻|婉|贬|褒|敬|谦|儿)[^>〉\n]{0,3}?[>〉]/g, "")
+    .replace(/\s{2,}/g, " ");
+}
+
 function polishTranslation(raw) {
-  let s = String(raw || "").replace(/\r/g, "").trim();
+  let s = stripLabels(String(raw || "").replace(/\r/g, "")).trim();
   if (!s) return "";
   s = s.replace(/```[a-z]*\n?/gi, "").replace(/```/g, "").trim();
   if (looksLikeThinking(s)) s = salvageAnswer(s);
@@ -613,7 +638,14 @@ async function handleTranslate(request, env, me) {
         if (ws.senses) {
           try {
             const ss = JSON.parse(ws.senses);
-            if (Array.isArray(ss) && ss.length) out.senses = ss;
+            if (Array.isArray(ss) && ss.length) {
+              out.senses = ss;
+              // 例句优先用义项自带的（结构化数据），不依赖文本拆行
+              if (ss[0] && ss[0].ex_en) {
+                out.example = ss[0].ex_en;
+                if (ss[0].ex_zh) out.example_zh = ss[0].ex_zh;
+              }
+            }
           } catch (e) {}
         }
       }
@@ -721,8 +753,9 @@ async function translateCore(env, me, text) {
     if (!usableTranslation(got)) {
       return { kind: "fail", err: "unusable (" + ((j || {}).model || "?") + ")", model: plan.model };
     }
-    if (!isWord || pickIpa(got)) return { kind: "clean", text: got, model: plan.model };  // 够好，收下
-    return { kind: "noipa", text: got, model: plan.model };   // 有释义但缺音标，先留住
+    if (!isWord) return { kind: "clean", text: got, model: plan.model };
+    if (pickIpa(got) && splitWordText(got).example) return { kind: "clean", text: got, model: plan.model };  // 够好，收下
+    return { kind: "noipa", text: got, model: plan.model };   // 有释义但缺音标/例句，先留作备胎
   }
 
   /* 短语与整句分流：短语（≤4 个词、无句末标点）要释义+例句，整句只要译文 */
@@ -788,7 +821,7 @@ async function translateCore(env, me, text) {
         return p;
       };
       const cleanDef = (defZh, pos) => {
-        let t = defZh.replace(/^(及物动词|不及物动词|形容词|名词|动词|副词|介词|连词|代词|感叹词|数词|冠词)\s*/, "");
+        let t = stripLabels(defZh).replace(/^(及物动词|不及物动词|形容词|名词|动词|副词|介词|连词|代词|感叹词|数词|冠词)\s*/, "");
         const pl = pos.toLowerCase().replace(/\.$/, "");
         if (pl && t.toLowerCase().startsWith(pl)) t = t.slice(pl.length).replace(/^[.、，,：:\s]+/, "");
         return t.trim();

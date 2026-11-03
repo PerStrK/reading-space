@@ -245,6 +245,7 @@ def cached(conn, text):
 
 
 def cache_put(conn, text, dst, model="enrich"):
+    dst = strip_labels(dst) if isinstance(dst, str) else dst
     conn.execute("INSERT OR REPLACE INTO translations (hash, src, dst, model, created_at) "
                  "VALUES (?,?,?,?,?)", (zh5(text), text[:300], dst[:1200], model, int(time.time() * 1000)))
 
@@ -272,6 +273,18 @@ def translate(conn, text, is_word, timeout=45):
     return out
 
 
+_LABEL_RE = re.compile(r"[<\u3008][^>\u3009\n]{0,4}?(\u53e3|\u6b63\u5f0f|\u4fda|\u4fd7|\u65b9|\u65e7|\u4e66\u9762|\u6587\u8a00|\u55bb|\u5a49|\u8d2c|\u8912|\u656c|\u8c26|\u513f)[^>\u3009\n]{0,3}?[>\u3009]")
+
+
+def strip_labels(s):
+    """Drop dictionary register labels (e.g. the 'colloquial' mark written
+    as <\u53e3> or with full-width brackets); they are lexicographic
+    symbols, meaningless to the reader."""
+    if not s:
+        return s
+    return re.sub(r"\s{2,}", " ", _LABEL_RE.sub("", str(s)))
+
+
 def word2_from_structured(model, word, timeout=45):
     """Strict rich word entry -> validated dict or None. Fields: uk_ipa,
     us_ipa, senses (<=3 of {pos, zh}), example_en, example_zh."""
@@ -291,7 +304,7 @@ def word2_from_structured(model, word, timeout=45):
         pm = re.match(r"^([A-Za-z]+\.?|\u540d\u8bcd|\u52a8\u8bcd|\u5f62\u5bb9\u8bcd|\u526f\u8bcd|\u4ecb\u8bcd|\u8fde\u8bcd|\u4ee3\u8bcd|\u611f\u53f9\u8bcd|\u6570\u8bcd|\u51a0\u8bcd)\s+(.+)$", head)
         if pm and re.search(r"[\u4e00-\u9fff]", pm.group(2)):
             if len(senses) < 3:
-                senses.append({"pos": _norm_pos(pm.group(1)), "zh": pm.group(2).strip()[:60],
+                senses.append({"pos": _norm_pos(pm.group(1)), "zh": strip_labels(pm.group(2).strip())[:60],
                                "ex_en": ex_en[:200], "ex_zh": ex_zh[:120]})
             elif senses:
                 senses[-1]["zh"] += ";" + head
@@ -301,7 +314,7 @@ def word2_from_structured(model, word, timeout=45):
         elif senses and re.search(r"[\u4e00-\u9fff]", head):
             senses[-1]["zh"] += ";" + head
         elif re.search(r"[\u4e00-\u9fff]", head):
-            senses.append({"pos": "", "zh": head[:60], "ex_en": ex_en[:200], "ex_zh": ex_zh[:120]})
+            senses.append({"pos": "", "zh": strip_labels(head)[:60], "ex_en": ex_en[:200], "ex_zh": ex_zh[:120]})
     if not senses:
         return None
     uk = _slash_ipa(str(d.get("uk_ipa") or ""))
@@ -354,7 +367,7 @@ def entry_from_text(text):
     ex_en = lines[1] if len(lines) > 1 else ""
     ex_zh = lines[2] if len(lines) > 2 else ""
     return {"uk_ipa": ipa, "us_ipa": "",
-            "senses": [{"pos": pos, "zh": zh[:60], "ex_en": ex_en[:200], "ex_zh": ex_zh[:120]}],
+            "senses": [{"pos": pos, "zh": strip_labels(zh)[:60], "ex_en": ex_en[:200], "ex_zh": ex_zh[:120]}],
             "example_en": ex_en, "example_zh": ex_zh}
 
 
