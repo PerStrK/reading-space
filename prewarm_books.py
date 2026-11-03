@@ -183,7 +183,12 @@ def main():
     common = top800()
     started = time.time()
     budget = [BATCH_WORDS]  # model-call words left for this whole run
-    books = conn.execute("SELECT id, format FROM books ORDER BY created_at DESC").fetchall()
+    # Priority (user, 2026-11-03): the three Magic Tree House books first,
+    # in reading order; everything else newest-first afterwards.
+    books = conn.execute(
+        "SELECT id, format FROM books ORDER BY "
+        "CASE id WHEN 'd44b2f52ece8f637' THEN 0 WHEN '8b3aad79b2cbacd4' THEN 1 "
+        "WHEN 'f87d8747bc68d032' THEN 2 ELSE 3 END, created_at DESC").fetchall()
     for b in books:
         if time.time() - started > TIMEBOX_S:
             break
