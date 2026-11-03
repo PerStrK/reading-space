@@ -107,7 +107,8 @@ KEY = openrouter_key()
 # 模型对“按 JSON 模板输出”的提示回了“请提供你希望我使用的 JSON 模板”，
 # 还给这句英文配了假音标，被当成词条 def 存进 word_store（pointed）。
 META_BAD = re.compile(r"JSON|模板|请提供|无效|需要修正|只输出|不要注释|单引号|双引号|"
-                      r"part_of_speech|term_en|phonetic|作为一个|我无法|无法提供")
+                      r"part_of_speech|term_en|phonetic|缺模板|严格格式|无法严格|已尽量|"
+                      r"需要考虑输出|输出有效|避免多余|作为一个|我无法|无法提供")
 
 
 def llm(sys_prompt, user_text, max_tokens=500, need_zh=True, timeout=45, models=None):
@@ -150,7 +151,7 @@ def llm_structured(model, name, schema, user_text, max_tokens=500, timeout=45):
     if not KEY:
         return None
     body = {"model": model,
-            "messages": [{"role": "system", "content": "英汉词典。严格按给定 JSON 模板输出，不要输出模板以外的任何内容。"},
+            "messages": [{"role": "system", "content": "英汉词典。"},
                          {"role": "user", "content": user_text}],
             "max_tokens": max_tokens, "temperature": 0,
             "reasoning": {"exclude": True},

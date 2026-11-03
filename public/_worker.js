@@ -628,7 +628,7 @@ function splitWordText(t) {
 }
 
 /* 模型偶尔会把思考过程写进正文（尤其实时推理类模型），这里做一次兜底清洗 */
-const COT_TELL = /(thinking process|思考过程|analyze the request|output format|draft\s*[:：]|task\s*[:：]|input\s*[:：]|step\s*\d|JSON\s*对象|只输出|需要修正|不要注释|单引号|双引号|part_of_speech|phonetic_en|term_en)/i;
+const COT_TELL = /(thinking process|思考过程|analyze the request|output format|draft\s*[:：]|task\s*[:：]|input\s*[:：]|step\s*\d|JSON\s*对象|只输出|需要修正|不要注释|单引号|双引号|part_of_speech|phonetic_en|term_en|缺模板|严格格式|无法严格|模板)/i;
 
 /* 模型有时在答完正文后继续自言自语地纠结输出格式（“…','phonetic_en':…}
    // 无效？注意 JSON 不能有注释…”），而且这段独白常直接粘在最后一行
@@ -636,7 +636,7 @@ const COT_TELL = /(thinking process|思考过程|analyze the request|output form
    再把截断点前残留的引号/括号/斜杠碎渣抹掉；若标记就在开头
    （整条都是独白），返回空串让上层判定不可用、换模型重试。
    2026-11-03 实测病例：skinny beak（DeepSeek flash）。 */
-const META_TAIL = /(JSON|json|无效\s*[?？]|需要修正|只输出|不要注释|单引号|双引号|part_of_speech|phonetic|term_en|definitions\s*array|examples\s*array)/;
+const META_TAIL = /(JSON|json|无效\s*[?？]|需要修正|只输出|不要注释|单引号|双引号|part_of_speech|phonetic|term_en|definitions\s*array|examples\s*array|缺模板|严格格式|无法严格|已尽量|需要考虑输出|输出有效|避免多余|模板)/;
 function cutMetaTail(s) {
   const m = META_TAIL.exec(s);
   if (!m) return s;
@@ -869,7 +869,7 @@ async function translateCore(env, me, text) {
     const body = {
       model,
       messages: [
-        { role: "system", content: "英汉词典。严格按给定 JSON 模板输出，不要输出模板以外的任何内容。" },
+        { role: "system", content: "英汉词典。" },
         { role: "user", content: text },
       ],
       max_tokens: 700,
