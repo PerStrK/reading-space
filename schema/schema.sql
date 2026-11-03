@@ -95,6 +95,43 @@ CREATE TABLE IF NOT EXISTS sentence_audio (
   PRIMARY KEY (hash, accent)
 );
 
+-- 全局单词库：词的内容只存一份，所有账户共用；vocab 行只记账户与词的关系
+CREATE TABLE IF NOT EXISTS word_store (
+  word       TEXT PRIMARY KEY,       -- 规范化词形
+  def        TEXT,                   -- 词义行（/音标/ 词性 中文释义）
+  example    TEXT,                   -- 词典例句（英文）
+  example_zh TEXT,                   -- 例句中文翻译
+  uk_ipa     TEXT,                   -- 英式音标（后台补全）
+  us_ipa     TEXT,                   -- 美式音标（后台补全）
+  updated_at INTEGER
+);
+
+-- 单词录音：英/美两版，按词共享，后台用 TTS 慢慢生成
+CREATE TABLE IF NOT EXISTS word_audio (
+  word       TEXT NOT NULL,
+  accent     TEXT NOT NULL,          -- uk | us
+  data       BLOB NOT NULL,          -- mp3
+  created_at INTEGER,
+  PRIMARY KEY (word, accent)
+);
+
+-- 缓存库的书-词索引：上传后后台预热产出（800 常用词之外的词 + 书中第一个原句）
+CREATE TABLE IF NOT EXISTS book_words (
+  book     TEXT NOT NULL,
+  word     TEXT NOT NULL,
+  sentence TEXT,                     -- 该词在书里第一次出现的原句（译文查 translations 缓存）
+  PRIMARY KEY (book, word)
+);
+
+-- 每本书的预热进度
+CREATE TABLE IF NOT EXISTS book_prewarm (
+  book       TEXT PRIMARY KEY,
+  total      INTEGER,
+  done       INTEGER,
+  status     TEXT,                   -- running | complete | skip-pdf
+  updated_at INTEGER
+);
+
 -- 句子表：整句/整段翻译时自动收进来的原句+译文，按账号分开
 -- （老库没有这两列/这张表也没关系：worker 首次用到时会自动补建，见 ensureVocabCols / ensureSentences）
 CREATE TABLE IF NOT EXISTS sentences (

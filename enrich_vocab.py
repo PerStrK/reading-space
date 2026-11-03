@@ -60,7 +60,7 @@ def openrouter_key():
 KEY = openrouter_key()
 
 
-def llm(sys_prompt, user_text, max_tokens=500, need_zh=True):
+def llm(sys_prompt, user_text, max_tokens=500, need_zh=True, timeout=45):
     """First usable answer from the model chain, else "".
 
     need_zh guards against reasoning junk for translation calls; IPA answers
@@ -81,7 +81,7 @@ def llm(sys_prompt, user_text, max_tokens=500, need_zh=True):
                      "authorization": "Bearer " + KEY,
                      "X-Title": "reading-space-enrich"})
         try:
-            with urllib.request.urlopen(req, timeout=45) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 j = json.loads(r.read().decode())
             got = (((j.get("choices") or [{}])[0].get("message") or {})
                    .get("content") or "").strip()
@@ -112,14 +112,27 @@ def cache_put(conn, text, dst, model="enrich"):
                  "VALUES (?,?,?,?,?)", (zh5(text), text[:300], dst[:1200], model, int(time.time() * 1000)))
 
 
-def translate(conn, text, is_word):
+def translate(conn, text, is_word, timeout=45):
     hit = cached(conn, text)
     if hit:
         return hit
-    out = llm(WORD_SYS if is_word else SENT_SYS, text, 500 if is_word else 300)
+    out = llm(WORD_SYS if is_word else SENT_SYS, text, 500 if is_word else 300, timeout=timeout)
     if out:
         cache_put(conn, text, out)
     return out
+
+
+def seed_store(conn, word, d, ex, exzh):
+    """Write word content into the global store, filling only empty fields."""
+    conn.execute(
+        "INSERT INTO word_store (word, def, example, example_zh, updated_at) VALUES (?,?,?,?,?) "
+        "ON CONFLICT(word) DO UPDATE SET "
+        "def = COALESCE(NULLIF(word_store.def,''), excluded.def), "
+        "example = COALESCE(NULLIF(word_store.example,''), excluded.example), "
+        "example_zh = COALESCE(NULLIF(word_store.example_zh,''), excluded.example_zh), "
+        "updated_at = excluded.updated_at",
+        (word, d or "", ex or "", exzh or "", int(time.time() * 1000)))
+    conn.commit()
 
 
 def is_single_word(t):
@@ -166,6 +179,14 @@ def main():
         "CREATE TABLE IF NOT EXISTS sentence_audio ("
         "hash TEXT NOT NULL, accent TEXT NOT NULL, data BLOB NOT NULL, created_at INTEGER, "
         "PRIMARY KEY (hash, accent))")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS word_store ("
+        "word TEXT PRIMARY KEY, def TEXT, example TEXT, example_zh TEXT, "
+        "uk_ipa TEXT, us_ipa TEXT, updated_at INTEGER)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS word_audio ("
+        "word TEXT NOT NULL, accent TEXT NOT NULL, data BLOB NOT NULL, created_at INTEGER, "
+        "PRIMARY KEY (word, accent))")
     conn.commit()
     done = []
 
@@ -204,34 +225,42 @@ def main():
                     conn.execute(
                         "UPDATE vocab SET example_zh = ? WHERE user = ? AND word = ? AND book = ?",
                         (parts[2], r["user"], r["word"], r["book"]))
+            seed_store(conn, r["word"], parts[0],
+                       parts[1] if len(parts) > 1 else "",
+                       parts[2] if len(parts) > 2 else "")
             done.append(f"split {r['word']}")
     except Exception as ex:
         print(f"split failed: {ex}", flush=True)
 
-    # 2) missing definitions
+    # 2) missing definitions -> global word store (content lives there once;
+    #    vocab rows stay slim relationship records)
     rows = conn.execute(
-        "SELECT user, word, book FROM vocab WHERE translation IS NULL OR translation = '' "
-        "LIMIT ?", (BATCH_DEF,)).fetchall()
+        "SELECT DISTINCT v.word FROM vocab v LEFT JOIN word_store s ON s.word = v.word "
+        "WHERE s.word IS NULL OR s.def IS NULL OR s.def = '' LIMIT ?", (BATCH_DEF,)).fetchall()
     for r in rows:
-        out = translate(conn, r["word"], is_single_word(r["word"]))
-        if not out:
-            continue
-        lines = [x.strip() for x in out.split("\n") if x.strip()]
-        with conn:
-            conn.execute(
-                "UPDATE vocab SET translation = ? WHERE user = ? AND word = ? AND book = ?",
-                (lines[0] if lines else out, r["user"], r["word"], r["book"]))
-            if len(lines) >= 2:
-                conn.execute(
-                    "UPDATE vocab SET example = ? WHERE user = ? AND word = ? AND book = ? "
-                    "AND (example IS NULL OR example = '')",
-                    (lines[1], r["user"], r["word"], r["book"]))
-            if len(lines) >= 3:
-                conn.execute(
-                    "UPDATE vocab SET example_zh = ? WHERE user = ? AND word = ? AND book = ? "
-                    "AND (example_zh IS NULL OR example_zh = '')",
-                    (lines[2], r["user"], r["word"], r["book"]))
-        done.append(f"def {r['word']}")
+        w = r["word"]
+        seeded = False
+        vr = conn.execute(
+            "SELECT translation FROM vocab WHERE word = ? AND translation IS NOT NULL "
+            "AND translation != '' LIMIT 1", (w,)).fetchone()
+        if vr:
+            parts = [x.strip() for x in vr["translation"].split("\n") if x.strip()]
+            if parts:
+                seed_store(conn, w, parts[0],
+                           parts[1] if len(parts) > 1 else "",
+                           parts[2] if len(parts) > 2 else "")
+                seeded = True
+        if not seeded:
+            out = translate(conn, w, is_single_word(w))
+            if out:
+                lines = [x.strip() for x in out.split("\n") if x.strip()]
+                if lines:
+                    seed_store(conn, w, lines[0],
+                               lines[1] if len(lines) > 1 else "",
+                               lines[2] if len(lines) > 2 else "")
+                    seeded = True
+        if seeded:
+            done.append(f"def {w}")
 
     # 3) missing context translations
     rows = conn.execute(
@@ -247,12 +276,14 @@ def main():
                 (out, r["user"], r["word"], r["book"], r["sentence"]))
         done.append(f"ctx-zh {r['word']}")
 
-    # 4) missing dual IPA
+    # 4) missing dual IPA -> global word store
     rows = conn.execute(
-        "SELECT DISTINCT word FROM vocab WHERE (uk_ipa IS NULL OR uk_ipa = '' OR us_ipa IS NULL OR us_ipa = '') "
+        "SELECT DISTINCT v.word FROM vocab v LEFT JOIN word_store s ON s.word = v.word "
+        "WHERE s.uk_ipa IS NULL OR s.uk_ipa = '' OR s.us_ipa IS NULL OR s.us_ipa = '' "
         "LIMIT ?", (BATCH_IPA,)).fetchall()
     for r in rows:
-        out = llm(IPA_SYS, r["word"], 120, need_zh=False)
+        w = r["word"]
+        out = llm(IPA_SYS, w, 120, need_zh=False)
         ipas = re.findall(r"/([^/\n]{1,40})/", out or "")
         if len(ipas) >= 2:
             uk, us = "/" + ipas[0] + "/", "/" + ipas[1] + "/"
@@ -262,12 +293,46 @@ def main():
             continue
         with conn:
             if us:
-                conn.execute("UPDATE vocab SET uk_ipa = ?, us_ipa = ? WHERE word = ?",
-                             (uk, us, r["word"]))
+                conn.execute(
+                    "INSERT INTO word_store (word, uk_ipa, us_ipa, updated_at) VALUES (?,?,?,?) "
+                    "ON CONFLICT(word) DO UPDATE SET uk_ipa = excluded.uk_ipa, "
+                    "us_ipa = excluded.us_ipa, updated_at = excluded.updated_at",
+                    (w, uk, us, int(time.time() * 1000)))
             else:
-                conn.execute("UPDATE vocab SET uk_ipa = ? WHERE word = ? AND (uk_ipa IS NULL OR uk_ipa = '')",
-                             (uk, r["word"]))
-        done.append(f"ipa {r['word']}")
+                conn.execute(
+                    "INSERT INTO word_store (word, uk_ipa, updated_at) VALUES (?,?,?) "
+                    "ON CONFLICT(word) DO UPDATE SET "
+                    "uk_ipa = COALESCE(NULLIF(word_store.uk_ipa,''), excluded.uk_ipa), "
+                    "updated_at = excluded.updated_at",
+                    (w, uk, int(time.time() * 1000)))
+        done.append(f"ipa {w}")
+
+    # 4b) missing word audio (the word itself, both accents; vocab words only)
+    rows = conn.execute("SELECT DISTINCT word FROM vocab").fetchall()
+    made_w = 0
+    for r in rows:
+        if made_w >= 4:
+            break
+        w = r["word"]
+        if not is_single_word(w):
+            continue
+        have = {x[0] for x in conn.execute(
+            "SELECT accent FROM word_audio WHERE word = ?", (w,)).fetchall()}
+        for accent, voice in (("uk", "en-GB-SoniaNeural"), ("us", "en-US-AriaNeural")):
+            if accent in have or made_w >= 4:
+                continue
+            try:
+                data = asyncio.run(tts(w, voice))
+            except Exception as ex:
+                print(f"  word tts failed ({accent} {w}): {ex}", flush=True)
+                data = b""
+            if data:
+                with conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO word_audio (word, accent, data, created_at) VALUES (?,?,?,?)",
+                        (w, accent, data, int(time.time() * 1000)))
+                made_w += 1
+                done.append(f"word-audio {accent} {w}")
 
     # 5) missing sentence audio
     rows = conn.execute("SELECT DISTINCT sentence FROM vocab_contexts LIMIT 200").fetchall()

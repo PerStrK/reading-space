@@ -107,6 +107,7 @@ export default {
       return listSentences(url, env, me);
     }
     if (path === "/api/sent-audio") return serveSentAudio(url, env, me);
+    if (path === "/api/word-audio") return serveWordAudio(url, env, me);
     if (path === "/api/sentences/users") return listSentenceUsers(env, me);
 
     // ---- 账号偏好（按账号分开存）----
@@ -580,6 +581,19 @@ async function translateCore(env, me, text) {
     await recordSentence(env, me, text, hit.dst);
     return { ok: true, text: hit.dst, ipa: pickIpa(hit.dst), cached: true };
   }
+  // 全局单词库：别的账户/预热已经查过的词，直接拼装返回，不再问模型
+  if (isWord && env.DB) {
+    try {
+      await ensureWordStore(env);
+      const ws = await env.DB.prepare(
+        "SELECT def, example, example_zh FROM word_store WHERE word = ?"
+      ).bind(normWord(text)).first();
+      if (ws && ws.def) {
+        const joined = [ws.def, ws.example, ws.example_zh].filter(Boolean).join("\n");
+        return { ok: true, text: joined, ipa: pickIpa(joined), cached: true };
+      }
+    } catch (e) {}
+  }
 
   // 主模型出不来可用结果（空、报错、把思考过程当答案）就换备用模型再试
   const plans = [
@@ -697,6 +711,9 @@ async function translateCore(env, me, text) {
   await env.DB.prepare(
     "INSERT OR REPLACE INTO translations (hash, src, dst, model, created_at) VALUES (?,?,?,?,?)"
   ).bind(hash, text.slice(0, 300), clean.slice(0, 1200), usedModel, Date.now()).run();
+  if (isWord) {
+    try { await upsertWordStore(env, normWord(text), splitWordText(clean)); } catch (e) {}
+  }
   await recordSentence(env, me, text, clean);
 
   return { ok: true, text: clean, ipa: pickIpa(clean), cached: false };
@@ -767,6 +784,62 @@ async function ensureVocabTables(env) {
     ).run();
   } catch (e) {}
   _vocabTablesOk = true;
+}
+
+let _wordStoreOk = false;
+async function ensureWordStore(env) {
+  // 全局单词库：词的内容（释义/例句/双音标/单词录音）只存一份，各账户共用；
+  // vocab 行只记「谁在哪本书遇见过这个词」的关系。book_words 是缓存库的
+  // 书-词索引（预热产出：每本书里 800 常用词外的词 + 它在书里的第一个原句）。
+  if (_wordStoreOk || !env.DB) return;
+  try {
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS word_store (" +
+      "word TEXT PRIMARY KEY, def TEXT, example TEXT, example_zh TEXT, " +
+      "uk_ipa TEXT, us_ipa TEXT, updated_at INTEGER)"
+    ).run();
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS word_audio (" +
+      "word TEXT NOT NULL, accent TEXT NOT NULL, data BLOB NOT NULL, created_at INTEGER, " +
+      "PRIMARY KEY (word, accent))"
+    ).run();
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS book_words (" +
+      "book TEXT NOT NULL, word TEXT NOT NULL, sentence TEXT, " +
+      "PRIMARY KEY (book, word))"
+    ).run();
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS book_prewarm (" +
+      "book TEXT PRIMARY KEY, total INTEGER, done INTEGER, status TEXT, updated_at INTEGER)"
+    ).run();
+  } catch (e) {}
+  _wordStoreOk = true;
+}
+
+async function upsertWordStore(env, word, p) {
+  // 只填空缺：先到先得，不覆盖已有内容
+  if (!word || !p || !p.def) return;
+  await ensureWordStore(env);
+  await env.DB.prepare(
+    "INSERT INTO word_store (word, def, example, example_zh, updated_at) VALUES (?,?,?,?,?) " +
+    "ON CONFLICT(word) DO UPDATE SET " +
+    "def = COALESCE(NULLIF(word_store.def,''), excluded.def), " +
+    "example = COALESCE(NULLIF(word_store.example,''), excluded.example), " +
+    "example_zh = COALESCE(NULLIF(word_store.example_zh,''), excluded.example_zh), " +
+    "updated_at = excluded.updated_at"
+  ).bind(word, p.def || "", p.example || "", p.exampleZh || "", Date.now()).run();
+}
+
+async function serveWordAudio(url, env, me) {
+  const w = normWord(url.searchParams.get("w") || "");
+  const a = String(url.searchParams.get("a") || "");
+  if (!w || (a !== "uk" && a !== "us")) return new Response("not found", { status: 404 });
+  await ensureWordStore(env);
+  const row = await env.DB.prepare("SELECT data FROM word_audio WHERE word = ? AND accent = ?").bind(w, a).first();
+  if (!row || !row.data) return new Response("not found", { status: 404 });
+  return new Response(blobBytes(row.data), {
+    headers: { "content-type": "audio/mpeg", "cache-control": "private, max-age=31536000, immutable" },
+  });
 }
 
 async function serveSentAudio(url, env, me) {
@@ -896,6 +969,17 @@ async function addVocab(request, env, me) {
       "sentence_zh = COALESCE(NULLIF(excluded.sentence_zh,''), vocab_contexts.sentence_zh)"
     ).bind(me.user, word, book, ctxSentence, sentenceZh, now, now).run();
   }
+  // 这次查到的词义顺手沉淀进全局单词库（只填空缺），所有账户共同复用
+  try {
+    if (trans) {
+      const p0 = splitWordText(trans);
+      await upsertWordStore(env, word, {
+        def: p0.def,
+        example: example || p0.example,
+        exampleZh: exampleZh || p0.exampleZh,
+      });
+    }
+  } catch (e) {}
   const row = await env.DB.prepare(
     "SELECT word, book, hits, translation FROM vocab WHERE user = ? AND word = ? AND book = ?"
   ).bind(me.user, word, book).first();
@@ -942,12 +1026,37 @@ async function listVocab(url, env, me) {
       });
     }
   } catch (e) {}
-  const items = (r.results || []).map((it) => ({
-    ...it,
-    ipa: pickIpa(it.translation || ""),
-    book_title: titles[it.book] || "",
-    contexts: ctxMap.get(it.word + "\n" + it.book) || [],
-  }));
+  // 内容从全局单词库拼装：生词行只存关系，词义/例句/双音标/单词录音都查全局库
+  await ensureWordStore(env);
+  const storeMap = new Map();
+  try {
+    const sr = await env.DB.prepare("SELECT word, def, example, example_zh, uk_ipa, us_ipa FROM word_store").all();
+    for (const s of sr.results || []) storeMap.set(s.word, s);
+  } catch (e) {}
+  const wAudioSet = new Set();
+  try {
+    const wr = await env.DB.prepare("SELECT word, accent FROM word_audio").all();
+    for (const x of wr.results || []) wAudioSet.add(x.word + "|" + x.accent);
+  } catch (e) {}
+  const items = (r.results || []).map((it) => {
+    const ws = storeMap.get(it.word) || {};
+    const merged = {
+      ...it,
+      translation: ws.def || it.translation || "",
+      example: it.example || ws.example || "",
+      example_zh: it.example_zh || ws.example_zh || "",
+      uk_ipa: ws.uk_ipa || it.uk_ipa || "",
+      us_ipa: ws.us_ipa || it.us_ipa || "",
+      word_audio_uk: wAudioSet.has(it.word + "|uk"),
+      word_audio_us: wAudioSet.has(it.word + "|us"),
+    };
+    return {
+      ...merged,
+      ipa: pickIpa(merged.translation || ""),
+      book_title: titles[it.book] || "",
+      contexts: ctxMap.get(it.word + "\n" + it.book) || [],
+    };
+  });
   return json({ items, user: target, self: me.user, role: me.role });
 }
 

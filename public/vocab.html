@@ -205,9 +205,15 @@ async function load() {
         (it.us_ipa ? "美 " + esc(it.us_ipa) : "") + "</span>"
       : (it.ipa ? '<span class="ipa">' + esc(it.ipa) + "</span>" : "");
     const ctxs = (it.contexts || []).map(ctxBlock).join("");
+    const waud = (it.word_audio_uk || it.word_audio_us)
+      ? '<span class="auds">' +
+        (it.word_audio_uk ? '<button class="aud waud" data-w="' + esc(it.word) + '" data-a="uk">🔊 英读</button>' : "") +
+        (it.word_audio_us ? '<button class="aud waud" data-w="' + esc(it.word) + '" data-a="us">🔊 美读</button>' : "") +
+        "</span>"
+      : "";
     return '<article class="vw' + (it.mastered ? " done" : "") + '">' +
       '<div class="vw-head"><span class="w">' + esc(it.word) + "</span>" +
-      ipas +
+      ipas + waud +
       (own ? '<span class="ops">' + mst +
              '<button class="del" data-w="' + esc(it.word) + '" data-b="' + esc(it.book) + '">删除</button></span>' : "") +
       "</div>" +
@@ -229,17 +235,20 @@ async function load() {
     html += '<h2 class="sechead">✅ 已掌握<span class="cnt2">' + done.length + " 个</span></h2>" + done.map(card).join("");
   }
   $("vlist").innerHTML = html;
-  // 原句录音（后台生成好才有按钮）：一个播放器轮着用，点别的自动切
-  $("vlist").querySelectorAll(".aud").forEach((b) => {
-    b.onclick = () => {
-      const url = "/api/sent-audio?h=" + encodeURIComponent(b.dataset.h) + "&a=" + b.dataset.a;
-      if (!window._aud) window._aud = new Audio();
-      const au = window._aud;
-      if (au.dataset.cur === url && !au.paused) { au.pause(); return; }
-      au.dataset.cur = url;
-      au.src = url;
-      au.play().catch(() => {});
-    };
+  // 录音（后台生成好才有按钮）：一个播放器轮着用，点别的自动切
+  const playUrl = (url) => {
+    if (!window._aud) window._aud = new Audio();
+    const au = window._aud;
+    if (au.dataset.cur === url && !au.paused) { au.pause(); return; }
+    au.dataset.cur = url;
+    au.src = url;
+    au.play().catch(() => {});
+  };
+  $("vlist").querySelectorAll(".aud[data-h]").forEach((b) => {
+    b.onclick = () => playUrl("/api/sent-audio?h=" + encodeURIComponent(b.dataset.h) + "&a=" + b.dataset.a);
+  });
+  $("vlist").querySelectorAll(".waud").forEach((b) => {
+    b.onclick = () => playUrl("/api/word-audio?w=" + encodeURIComponent(b.dataset.w) + "&a=" + b.dataset.a);
   });
   if (own) {
     $("vlist").querySelectorAll(".mst").forEach((b) => {
