@@ -472,12 +472,50 @@ async function delReadingBookmark(url, env, me) {
 
 /* ---------- 翻译与生词 ---------- */
 
-// 主模型：nemotron-3.5-super-vl 免费档，实测中位 2.9 秒、6 次里成功 5 次，
-//       输出格式最标准（词性+释义+英文例句+中文翻译），日常零成本。
-// 备用：DeepSeek flash 最便宜的一档（约 $0.0001/次），免费档限流 429 时顶上。
+// 翻译链（2026-11-03 起）：ultra 免费软约束（质量主力）与 dots 免费
+// 严格模板、nano 免费软约束三路对冲，DeepSeek flash 兜底（先严格、后软约束）。
 const TR_DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free";
 const TR_FALLBACK_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free";
 const TR_FALLBACK2_MODEL = "~deepseek/deepseek-flash-latest";
+
+/* Structured Outputs（严格模板）：不是所有模型都支持——2026-11-03 实测
+   dots-3-note 免费档与 DeepSeek flash 支持，ultra / nano 不支持（强加
+   response_format + require_parameters 会直接 404）。支持的 super-vl 免费
+   档实测回空太多（多次 0 成功），故免费严格位用 dots（约半数一次合格，
+   失败就当没这回事）。严格版只用在 dots 对冲与 DeepSeek 兜底上，中间仍
+   走软约束链。拿到 JSON 后统一拼回现有三行文本，下游缓存/生词本都不用改。 */
+const TR_STRICT_MODEL = "dots-studio/dots-3-note-preview:free";
+const WORD_SCHEMA = {
+  type: "object",
+  properties: {
+    ipa: { type: "string", description: "国际音标，两侧带斜杠，如 /ˈmɪərkæt/" },
+    pos: { type: "string", description: "词性缩写，如 n. / v. / adj." },
+    def_zh: { type: "string", description: "中文释义，不超过 40 字" },
+    example_en: { type: "string", description: "一句简短英文例句" },
+    example_zh: { type: "string", description: "上面例句的中文翻译" },
+  },
+  required: ["ipa", "pos", "def_zh", "example_en", "example_zh"],
+  additionalProperties: false,
+};
+const PHRASE_SCHEMA = {
+  type: "object",
+  properties: {
+    pos: { type: "string", description: "词性或短语类型，如 v. phr." },
+    def_zh: { type: "string", description: "中文释义，不超过 40 字" },
+    example_en: { type: "string", description: "一句简短英文例句" },
+    example_zh: { type: "string", description: "上面例句的中文翻译" },
+  },
+  required: ["pos", "def_zh", "example_en", "example_zh"],
+  additionalProperties: false,
+};
+const SENT_SCHEMA = {
+  type: "object",
+  properties: {
+    translation_zh: { type: "string", description: "整句的中文译文" },
+  },
+  required: ["translation_zh"],
+  additionalProperties: false,
+};
 
 async function sha256hex(str) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
@@ -665,6 +703,105 @@ async function translateCore(env, me, text) {
     return { kind: "noipa", text: got, model: plan.model };   // 有释义但缺音标，先留住
   }
 
+  /* 短语与整句分流：短语（≤4 个词、无句末标点）要释义+例句，整句只要译文 */
+  const isPhrase = !isWord && text.split(/\s+/).filter(Boolean).length <= 4 && !/[.!?。！？]/.test(text);
+
+  /* 严格模板单次尝试：response_format=json_schema + require_parameters。
+     只喂给支持 structured_outputs 的模型（dots / DeepSeek）；不支持的
+     供应商会被 OpenRouter 直接挡下（404），不会瞎编格式。拿到 JSON 后做
+     字段与中文校验，再拼回现有三行文本，缓存与下游格式完全不变。 */
+  async function tryStrictPlan(model, timeoutMs) {
+    const schema = isWord ? WORD_SCHEMA : (isPhrase ? PHRASE_SCHEMA : SENT_SCHEMA);
+    const name = isWord ? "word_translation" : (isPhrase ? "phrase_translation" : "sentence_translation");
+    const body = {
+      model,
+      messages: [
+        { role: "system", content: "英汉词典。严格按给定 JSON 模板输出，不要输出模板以外的任何内容。" },
+        { role: "user", content: text },
+      ],
+      max_tokens: 700,
+      temperature: 0,
+      reasoning: { exclude: true },
+      response_format: { type: "json_schema", json_schema: { name, strict: true, schema } },
+      provider: { require_parameters: true },
+    };
+    const hdrs = {
+      "content-type": "application/json",
+      authorization: "Bearer " + env.OPENROUTER_KEY,
+      "X-Title": "reading-space",
+    };
+    if (env.SITE_URL) hdrs["HTTP-Referer"] = env.SITE_URL;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    let r;
+    try {
+      r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: hdrs,
+        body: JSON.stringify(body),
+        signal: ctl.signal,
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      return { kind: "fail", err: "strict network" };
+    }
+    clearTimeout(timer);
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      return { kind: "fail", err: "strict upstream " + r.status + " " + t.slice(0, 120) };
+    }
+    try {
+      const j = await r.json().catch(() => null);
+      const msg = (((j || {}).choices || [])[0] || {}).message || {};
+      const raw = String(msg.content || "").replace(/```[a-z]*\n?/gi, "").replace(/```/g, "").trim();
+      const d = JSON.parse(raw);
+      const S = (v) => String(v == null ? "" : v).trim();
+      const hasZh = (v) => /[\u4e00-\u9fa5]/.test(v);
+      /* 严格模型偶尔把词性写全称、把词性混进释义、或在音标里夹杂符号，统一收拾 */
+      const POS_MAP = { noun: "n.", verb: "v.", adjective: "adj.", adverb: "adv.", preposition: "prep.", conjunction: "conj.", pronoun: "pron.", interjection: "int.", article: "art.", auxiliary: "aux." };
+      const normPos = (p) => {
+        const low = p.toLowerCase().replace(/\.$/, "");
+        if (POS_MAP[low]) return POS_MAP[low];
+        if (/^(n|v|adj|adv|prep|conj|pron|int|art|aux)$/.test(low)) return low + ".";
+        return p;
+      };
+      const cleanDef = (defZh, pos) => {
+        let t = defZh.replace(/^(及物动词|不及物动词|形容词|名词|动词|副词|介词|连词|代词|感叹词|数词|冠词)\s*/, "");
+        const pl = pos.toLowerCase().replace(/\.$/, "");
+        if (pl && t.toLowerCase().startsWith(pl)) t = t.slice(pl.length).replace(/^[.、，,：:\s]+/, "");
+        return t.trim();
+      };
+      let got = "";
+      if (isWord) {
+        let ipa = S(d.ipa).replace(/^\/+|\/+$/g, "").replace(/^[\[\]:\s]+|[\[\]:\s]+$/g, "");
+        const pos = normPos(S(d.pos));
+        const defZh = cleanDef(S(d.def_zh), pos);
+        const ex = S(d.example_en), exZh = S(d.example_zh);
+        if (!ipa || !defZh || !ex || !exZh || !hasZh(defZh) || !hasZh(exZh)) {
+          return { kind: "fail", err: "strict invalid fields", model };
+        }
+        got = ["/" + ipa + "/", pos, defZh].filter(Boolean).join(" ") + "\n" + ex + "\n" + exZh;
+      } else if (isPhrase) {
+        const pos = normPos(S(d.pos));
+        const defZh = cleanDef(S(d.def_zh), pos);
+        const ex = S(d.example_en), exZh = S(d.example_zh);
+        if (!defZh || !ex || !exZh || !hasZh(defZh) || !hasZh(exZh)) {
+          return { kind: "fail", err: "strict invalid fields", model };
+        }
+        got = [pos, defZh].filter(Boolean).join(" ") + "\n" + ex + "\n" + exZh;
+      } else {
+        got = S(d.translation_zh);
+        if (!hasZh(got)) return { kind: "fail", err: "strict invalid fields", model };
+      }
+      got = polishTranslation(got);
+      if (!usableTranslation(got)) return { kind: "fail", err: "strict unusable", model };
+      if (isWord && !pickIpa(got)) return { kind: "fail", err: "strict no ipa", model };
+      return { kind: "clean", text: got, model };
+    } catch (e) {
+      return { kind: "fail", err: "strict parse", model };
+    }
+  }
+
   function absorb(res) {
     if (!res) return;
     if (res.kind === "clean" && !clean) {
@@ -678,29 +815,41 @@ async function translateCore(env, me, text) {
     }
   }
 
-  // 两个免费模型对冲：先发第一个；它先结束却没出最终答案就立刻发第二个，
-  // 6 秒还没结束也把第二个发出去——谁先给出够好的答案就用谁。
+  // 免费三路对冲：ultra 软约束（质量主力）→ dots 严格模板 → nano 软约束。
+  // 先发第一个；它先结束却没出最终答案就立刻发下一个，6 秒还没结束也把
+  // 下一个发出去——谁先给出够好的答案就用谁。
+  const freeAttempts = [
+    () => tryPlan(plans[0], 25000),
+    () => tryStrictPlan(env.TRANSLATE_STRICT || TR_STRICT_MODEL, 15000),
+    () => tryPlan(plans[1], 25000),
+  ];
   await new Promise((resolve) => {
-    const total = Math.min(2, plans.length);
-    let started = 0, settled = 0, finished = false;
+    const launched = new Set();
+    let settled = 0, finished = false;
     const done = () => { if (!finished) { finished = true; resolve(); } };
+    const nextIdx = () => {
+      for (let i = 0; i < freeAttempts.length; i++) if (!launched.has(i)) return i;
+      return -1;
+    };
     const launch = (idx) => {
-      if (idx >= total || finished) return;
-      started++;
-      tryPlan(plans[idx], 25000).then((res) => {
+      if (idx < 0 || finished || launched.has(idx)) return;
+      launched.add(idx);
+      freeAttempts[idx]().then((res) => {
         absorb(res);
         settled++;
         if (clean) return done();
-        if (idx === 0 && started < total) launch(1);
-        if (settled >= total) done();
+        const n = nextIdx();
+        if (n >= 0) launch(n);
+        if (settled >= freeAttempts.length) done();
       });
     };
     launch(0);
-    setTimeout(() => { if (!finished && !clean && started < total) launch(1); }, 6000);
+    setTimeout(() => { if (!finished && !clean) { const n = nextIdx(); if (n >= 0) launch(n); } }, 6000);
   });
-  // 免费模型都没出最终答案，最后用 DeepSeek 兜底（快、稳）
+  // 免费的都没出最终答案，最后用 DeepSeek 兜底：先严格模板，不成再走软约束
   if (!clean && plans.length > 2) {
-    absorb(await tryPlan(plans[2], 25000));
+    absorb(await tryStrictPlan(plans[2].model, 25000));
+    if (!clean) absorb(await tryPlan(plans[2], 25000));
   }
   if (!clean && noIpa) usedModel = noIpaModel;
   if (!clean) clean = noIpa;             // 音标没要到，至少把释义给出来

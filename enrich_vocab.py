@@ -38,6 +38,36 @@ MODELS = ["nvidia/nemotron-3-ultra-550b-a55b:free",
           "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
           "~deepseek/deepseek-flash-latest"]
 
+# Structured Outputs (strict JSON schema): only some models support it
+# (verified 2026-11-03: dots-3-note free, super-vl free and DeepSeek flash
+# do; ultra / nano return 404 when require_parameters is set). The free
+# strict models are flaky (frequent empty answers; dots hits roughly half
+# the time, super-vl less), so strict is only ever an opportunistic first
+# attempt. Results are validated field by field and reassembled into the
+# same three-line text the soft chain produces, so caches and consumers
+# see no format change.
+STRICT_FREE_MODEL = "dots-studio/dots-3-note-preview:free"
+STRICT_FREE_MODEL2 = "nvidia/nemotron-3.5-super-vl:free"
+WORD_SCHEMA = {"type": "object",
+               "properties": {
+                   "ipa": {"type": "string", "description": "IPA wrapped in slashes, e.g. /ˈmɪərkæt/"},
+                   "pos": {"type": "string", "description": "Part of speech, e.g. n. / v. / adj."},
+                   "def_zh": {"type": "string", "description": "Chinese meaning, <= 40 chars"},
+                   "example_en": {"type": "string", "description": "One short English example sentence"},
+                   "example_zh": {"type": "string", "description": "Chinese translation of the example"}},
+               "required": ["ipa", "pos", "def_zh", "example_en", "example_zh"],
+               "additionalProperties": False}
+SENT_SCHEMA = {"type": "object",
+               "properties": {"translation_zh": {"type": "string", "description": "Chinese translation of the whole sentence"}},
+               "required": ["translation_zh"],
+               "additionalProperties": False}
+IPA_SCHEMA = {"type": "object",
+              "properties": {
+                  "uk_ipa": {"type": "string", "description": "British IPA wrapped in slashes"},
+                  "us_ipa": {"type": "string", "description": "American IPA wrapped in slashes"}},
+              "required": ["uk_ipa", "us_ipa"],
+              "additionalProperties": False}
+
 WORD_SYS = ("英汉词典。只输出三行，不要思考过程、不要步骤、不要 Markdown、不要加粗。"
             "第一行：「/国际音标/ 词性 中文释义」，音标两侧必须加斜杠，例如 /ˈmɪərkæt/ n. 猫鼬；"
             "第二行：一句简短英文例句；第三行：第二行例句的中文翻译。中文释义不超过 40 字。")
@@ -60,7 +90,7 @@ def openrouter_key():
 KEY = openrouter_key()
 
 
-def llm(sys_prompt, user_text, max_tokens=500, need_zh=True, timeout=45):
+def llm(sys_prompt, user_text, max_tokens=500, need_zh=True, timeout=45, models=None):
     """First usable answer from the model chain, else "".
 
     need_zh guards against reasoning junk for translation calls; IPA answers
@@ -68,7 +98,7 @@ def llm(sys_prompt, user_text, max_tokens=500, need_zh=True, timeout=45):
     """
     if not KEY:
         return ""
-    for model in MODELS:
+    for model in (models or MODELS):
         body = {"model": model,
                 "messages": [{"role": "system", "content": sys_prompt},
                              {"role": "user", "content": user_text}],
@@ -91,6 +121,100 @@ def llm(sys_prompt, user_text, max_tokens=500, need_zh=True, timeout=45):
         except Exception as ex:
             print(f"  llm {model} failed: {ex}", flush=True)
     return ""
+
+
+def llm_structured(model, name, schema, user_text, max_tokens=500, timeout=45):
+    """One strict-schema call; parsed dict on success, else None."""
+    if not KEY:
+        return None
+    body = {"model": model,
+            "messages": [{"role": "system", "content": "英汉词典。严格按给定 JSON 模板输出，不要输出模板以外的任何内容。"},
+                         {"role": "user", "content": user_text}],
+            "max_tokens": max_tokens, "temperature": 0,
+            "reasoning": {"exclude": True},
+            "response_format": {"type": "json_schema",
+                                "json_schema": {"name": name, "strict": True, "schema": schema}},
+            "provider": {"require_parameters": True}}
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"content-type": "application/json",
+                 "authorization": "Bearer " + KEY,
+                 "X-Title": "reading-space-enrich"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            j = json.loads(r.read().decode())
+        got = (((j.get("choices") or [{}])[0].get("message") or {})
+               .get("content") or "").strip()
+        got = re.sub(r"```[a-z]*|```", "", got).strip()
+        return json.loads(got)
+    except Exception as ex:
+        print(f"  llm_structured {model} failed: {ex}", flush=True)
+        return None
+
+
+def _slash_ipa(v):
+    v = (v or "").strip().strip("/")
+    v = v.strip("[]: ").strip()
+    return "/" + v + "/" if v else ""
+
+
+_POS_MAP = {"noun": "n.", "verb": "v.", "adjective": "adj.", "adverb": "adv.",
+            "preposition": "prep.", "conjunction": "conj.", "pronoun": "pron.",
+            "interjection": "int.", "article": "art.", "auxiliary": "aux."}
+
+
+def _norm_pos(p):
+    low = (p or "").strip().lower().rstrip(".")
+    if low in _POS_MAP:
+        return _POS_MAP[low]
+    if re.fullmatch(r"n|v|adj|adv|prep|conj|pron|int|art|aux", low):
+        return low + "."
+    return (p or "").strip()
+
+
+def _clean_def(def_zh, pos):
+    t = re.sub(r"^(及物动词|不及物动词|形容词|名词|动词|副词|介词|连词|代词|感叹词|数词|冠词)\s*", "", (def_zh or "").strip())
+    pl = (pos or "").lower().rstrip(".")
+    if pl and t.lower().startswith(pl):
+        t = re.sub(r"^[.、，,：:\s]+", "", t[len(pl):])
+    return t.strip()
+
+
+def word_from_structured(model, word, timeout=45):
+    """Strict word entry -> the usual three-line text, or ""."""
+    d = llm_structured(model, "word_translation", WORD_SCHEMA, word, timeout=timeout)
+    if not d:
+        return ""
+    ipa = _slash_ipa(str(d.get("ipa") or ""))
+    pos = _norm_pos(str(d.get("pos") or ""))
+    def_zh = _clean_def(str(d.get("def_zh") or ""), pos)
+    ex = str(d.get("example_en") or "").strip()
+    ex_zh = str(d.get("example_zh") or "").strip()
+    if not ipa or not def_zh or not ex or not ex_zh:
+        return ""
+    if not re.search(r"[\u4e00-\u9fa5]", def_zh) or not re.search(r"[\u4e00-\u9fa5]", ex_zh):
+        return ""
+    return "\n".join([" ".join(x for x in (ipa, pos, def_zh) if x), ex, ex_zh])
+
+
+def sent_from_structured(model, text, timeout=45):
+    """Strict sentence translation -> just the Chinese text, or ""."""
+    d = llm_structured(model, "sentence_translation", SENT_SCHEMA, text, timeout=timeout)
+    if not d:
+        return ""
+    zh = str(d.get("translation_zh") or "").strip()
+    return zh if re.search(r"[\u4e00-\u9fa5]", zh) else ""
+
+
+def ipa_from_structured(model, word, timeout=45):
+    """Strict dual IPA -> (uk, us) with slashes, or None."""
+    d = llm_structured(model, "dual_ipa", IPA_SCHEMA, word, max_tokens=200, timeout=timeout)
+    if not d:
+        return None
+    uk = _slash_ipa(str(d.get("uk_ipa") or ""))
+    us = _slash_ipa(str(d.get("us_ipa") or ""))
+    return (uk, us) if uk and us else None
 
 
 def zh5(text):
@@ -116,7 +240,20 @@ def translate(conn, text, is_word, timeout=45):
     hit = cached(conn, text)
     if hit:
         return hit
-    out = llm(WORD_SYS if is_word else SENT_SYS, text, 500 if is_word else 300, timeout=timeout)
+    # Order (free first, paid last): dots strict -> super-vl strict ->
+    # ultra/nano soft -> DeepSeek strict -> DeepSeek soft.
+    strict_fn = word_from_structured if is_word else sent_from_structured
+    out = strict_fn(STRICT_FREE_MODEL, text, timeout=timeout)
+    if not out:
+        out = strict_fn(STRICT_FREE_MODEL2, text, timeout=timeout)
+    if not out:
+        out = llm(WORD_SYS if is_word else SENT_SYS, text,
+                  500 if is_word else 300, timeout=timeout, models=MODELS[:2])
+    if not out:
+        out = strict_fn(MODELS[2], text, timeout=timeout)
+    if not out:
+        out = llm(WORD_SYS if is_word else SENT_SYS, text,
+                  500 if is_word else 300, timeout=timeout, models=MODELS[2:])
     if out:
         cache_put(conn, text, out)
     return out
@@ -283,7 +420,11 @@ def main():
         "LIMIT ?", (BATCH_IPA,)).fetchall()
     for r in rows:
         w = r["word"]
-        out = llm(IPA_SYS, w, 120, need_zh=False)
+        pair = ipa_from_structured(STRICT_FREE_MODEL, w) or ipa_from_structured(STRICT_FREE_MODEL2, w)
+        if pair:
+            out = "UK: %s US: %s" % pair
+        else:
+            out = llm(IPA_SYS, w, 120, need_zh=False)
         ipas = re.findall(r"/([^/\n]{1,40})/", out or "")
         if len(ipas) >= 2:
             uk, us = "/" + ipas[0] + "/", "/" + ipas[1] + "/"
