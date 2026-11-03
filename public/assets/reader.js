@@ -158,6 +158,11 @@
     all[BID] = list.concat([{ cfi: cfi, text: (text || "").slice(0, 120) }]);
     lsSet(LS_H, all);
     paintHl(cfi);
+    // 同步到服务器，换设备打开同一本书也能看到（失败不影响本地使用）
+    api("/api/reading/highlights", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ book: BID, cfi: cfi, text: (text || "").slice(0, 120) })
+    }).catch(function () {});
   }
 
   function markHighlight(cfi, text) {
@@ -178,6 +183,39 @@
     if (list.length) all[BID] = list; else delete all[BID];
     lsSet(LS_H, all);
     unpaintHl(cfi);
+    api("/api/reading/highlights?book=" + encodeURIComponent(BID) + "&cfi=" + encodeURIComponent(cfi),
+      { method: "DELETE" }).catch(function () {});
+  }
+
+  // 打开书时与服务器对账：服务器有的并回本机；本机独有的（老高亮或离线
+  // 加的）顺手补报服务器。之后各设备打开同一本书，看到的是同一套高亮。
+  function syncHighlights() {
+    api("/api/reading/highlights?book=" + encodeURIComponent(BID)).then(function (j) {
+      var items = (j && j.items) || [];
+      var all = hlAll();
+      var list = hlOf();
+      var seen = {};
+      list.forEach(function (h) { seen[h.cfi] = 1; });
+      var changed = false;
+      items.forEach(function (it) {
+        if (it.cfi && !seen[it.cfi]) {
+          list.push({ cfi: it.cfi, text: it.text || "" });
+          seen[it.cfi] = 1;
+          changed = true;
+        }
+      });
+      if (changed) { all[BID] = list; lsSet(LS_H, all); }
+      // 本机有、服务器没有的，补报上去（最多报 60 条，防老数据洪峰）
+      var onServer = {};
+      items.forEach(function (it) { onServer[it.cfi] = 1; });
+      list.filter(function (h) { return !onServer[h.cfi]; }).slice(0, 60).forEach(function (h) {
+        api("/api/reading/highlights", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ book: BID, cfi: h.cfi, text: h.text || "" })
+        }).catch(function () {});
+      });
+      paintAllHl();
+    }).catch(function () { paintAllHl(); });
   }
 
   // 选区对应的 cfi 是否已有高亮：先精确匹配，再按范围求交集（同一篇内）
@@ -348,7 +386,8 @@
     }).then(function (j) {
       var out;
       if (j.is_word) {
-        // 单词：释义 + 例句（带译文）+ 所在原句（带译文），分块展示
+        // 单词：释义 + 例句（带译文）分块展示。所在原句不显示——它只在
+        // 后台进句子库排队补译（用户 2026-11-03 定）。
         var def = cleanTrans(String(j.text || "").split(/\n+/)[0] || "");
         popState.extra = { def: def, example: j.example || "", exampleZh: j.example_zh || "", sentenceZh: j.sentence_zh || "",
           ukIpa: j.uk_ipa || "", usIpa: j.us_ipa || "", senses: (j.senses && j.senses.length) ? j.senses : null };
@@ -363,7 +402,6 @@
           out = def;
         }
         if (j.example) out += "\n例句：" + j.example + (j.example_zh ? "\n" + j.example_zh : "");
-        if (popState.sentence) out += "\n原句：" + popState.sentence + (j.sentence_zh ? "\n" + j.sentence_zh : "");
       } else {
         popState.extra = null;
         out = cleanTrans(j.text);
@@ -572,8 +610,9 @@
     markFlowButtons();
     rendition.display(cfi || undefined);
 
-    // 高亮随 rendition 重建后重新铺（等首页渲染完再铺，Range 才取得出矩形）
-    setTimeout(paintAllHl, 300);
+    // 高亮随 rendition 重建后重新铺（等首页渲染完再铺，Range 才取得出矩形）；
+    // 打开时先和服务器对账再铺，跨设备看到同一套高亮
+    setTimeout(syncHighlights, 300);
   }
 
   function markFlowButtons() {

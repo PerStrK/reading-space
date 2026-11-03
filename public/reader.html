@@ -55,7 +55,7 @@ body{font-family:-apple-system,"PingFang SC","Hiragino Sans GB","Microsoft YaHei
 #pop{position:absolute; left:50%; bottom:10px; transform:translateX(-50%); z-index:60; display:none;
   flex-direction:column; background:#22262b; color:#f8f3e9; border-radius:16px; padding:10px 12px 12px;
   box-shadow:0 12px 34px rgba(0,0,0,.34); font-size:13px; width:min(94%,460px);
-  max-height:64vh; overflow:hidden}
+  max-height:72vh; overflow:hidden}
 #pop.on{display:flex}
 #pop .hd{display:flex; align-items:flex-start; gap:8px; flex:0 0 auto}
 #pop .w{flex:1 1 auto; min-width:0; color:#ffd9a8; font-size:12.5px; line-height:1.5;
@@ -71,10 +71,10 @@ body{font-family:-apple-system,"PingFang SC","Hiragino Sans GB","Microsoft YaHei
 #pop button.primary:hover{background:#1f6162}
 #pop .tr{margin-top:9px; padding-top:9px; border-top:1px solid rgba(255,255,255,.14);
   line-height:1.62; font-size:12.8px; white-space:pre-wrap; display:none; position:relative;
-  max-height:5.2em; overflow:hidden}
+  max-height:24vh; overflow:hidden}
 #pop .tr.on{display:block}
 /* 展开后自己是一块可滚区域：再长的译文也只在气泡里滑动，不会顶出屏幕 */
-#pop .tr.full{max-height:42vh; overflow-y:auto; -webkit-overflow-scrolling:touch; overscroll-behavior:contain;
+#pop .tr.full{max-height:45vh; overflow-y:auto; -webkit-overflow-scrolling:touch; overscroll-behavior:contain;
   padding-right:4px}
 #pop .tr.full::-webkit-scrollbar{width:6px}
 #pop .tr.full::-webkit-scrollbar-thumb{background:rgba(255,255,255,.28); border-radius:3px}
@@ -87,6 +87,11 @@ body{font-family:-apple-system,"PingFang SC","Hiragino Sans GB","Microsoft YaHei
 #pop .more.on{display:block}
 #pop .more button{background:rgba(255,255,255,.08); color:#cfd6e6; padding:4px 10px; font-size:12px}
 #pop .more button:hover{background:rgba(255,255,255,.16); color:#fff}
+@media (min-width:768px){
+  #pop{max-height:84vh}
+  #pop .tr{max-height:38vh}
+  #pop .tr.full{max-height:58vh}
+}
 /* 连续滚动模式：底部翻页键不再有意义 */
 body.scrolled #bot button{opacity:.3; pointer-events:none}
 #toast{position:fixed; left:50%; bottom:76px; transform:translateX(-50%); background:rgba(34,38,43,.92);

@@ -227,3 +227,11 @@ CREATE TABLE IF NOT EXISTS sentence_refs (
   hits INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (hash, book, word, user)
 );
 CREATE INDEX IF NOT EXISTS idx_sentence_refs_book ON sentence_refs(book, last_at DESC);
+
+-- Per-account highlights, synced across devices (2026-11-03). The worker
+-- also creates this lazily (ensureHighlights), so this is documentation.
+CREATE TABLE IF NOT EXISTS reading_highlights (
+  user TEXT NOT NULL, book TEXT NOT NULL, cfi TEXT NOT NULL,
+  text TEXT NOT NULL DEFAULT '', created_at INTEGER,
+  PRIMARY KEY (user, book, cfi)
+);

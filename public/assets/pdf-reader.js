@@ -764,7 +764,8 @@
     }).then(function (j) {
       var out;
       if (j.is_word) {
-        // 单词：释义 + 例句（带译文）+ 所在原句（带译文），分块展示
+        // 单词：释义 + 例句（带译文）分块展示。所在原句不显示——它只在
+        // 后台进句子库排队补译（用户 2026-11-03 定）。
         var def = cleanTrans(String(j.text || "").split(/\n+/)[0] || "");
         popState.extra = { def: def, example: j.example || "", exampleZh: j.example_zh || "", sentenceZh: j.sentence_zh || "",
           ukIpa: j.uk_ipa || "", usIpa: j.us_ipa || "", senses: (j.senses && j.senses.length) ? j.senses : null };
@@ -779,7 +780,6 @@
           out = def;
         }
         if (j.example) out += "\n例句：" + j.example + (j.example_zh ? "\n" + j.example_zh : "");
-        if (popState.sentence) out += "\n原句：" + popState.sentence + (j.sentence_zh ? "\n" + j.sentence_zh : "");
       } else {
         popState.extra = null;
         out = cleanTrans(j.text);

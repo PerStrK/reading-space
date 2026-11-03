@@ -85,6 +85,11 @@ export default {
       if (request.method === "DELETE") return delReadingBookmark(url, env, me);
       return listReadingBookmarks(url, env, me);
     }
+    if (path === "/api/reading/highlights") {
+      if (request.method === "POST") return addReadingHighlight(request, env, me);
+      if (request.method === "DELETE") return delReadingHighlight(url, env, me);
+      return listReadingHighlights(url, env, me);
+    }
 
     // ---- 划词翻译 + 生词本 ----
     if (path === "/api/translate") {
@@ -467,6 +472,49 @@ async function delReadingBookmark(url, env, me) {
   const id = String(url.searchParams.get("id") || "");
   if (!id) return json({ ok: false, error: "missing id" }, 400);
   await env.DB.prepare("DELETE FROM reading_bookmarks WHERE id = ? AND user = ?").bind(id, me.user).run();
+  return json({ ok: true });
+}
+
+/* Highlights live server-side per account (2026-11-03) so a word marked
+   on one device shows up on the reader's other devices; the reader's
+   localStorage stays as an offline cache and merge mirror. */
+async function ensureHighlights(env) {
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS reading_highlights (user TEXT NOT NULL, book TEXT NOT NULL, " +
+    "cfi TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', created_at INTEGER, PRIMARY KEY (user, book, cfi))"
+  ).run();
+}
+
+async function listReadingHighlights(url, env, me) {
+  await ensureHighlights(env);
+  const book = String(url.searchParams.get("book") || "").slice(0, 60);
+  if (!book) return json({ ok: false, error: "missing book" }, 400);
+  const r = await env.DB.prepare(
+    "SELECT cfi, text, created_at FROM reading_highlights WHERE user = ? AND book = ? ORDER BY created_at ASC"
+  ).bind(me.user, book).all();
+  return json({ items: r.results || [] });
+}
+
+async function addReadingHighlight(request, env, me) {
+  let b;
+  try { b = await request.json(); } catch (e) { return json({ ok: false, error: "bad json" }, 400); }
+  const book = String(b.book || "").slice(0, 60);
+  const cfi = String(b.cfi || "").slice(0, 400);
+  if (!book || !cfi) return json({ ok: false, error: "missing" }, 400);
+  await ensureHighlights(env);
+  await env.DB.prepare(
+    "INSERT INTO reading_highlights (user, book, cfi, text, created_at) VALUES (?,?,?,?,?) " +
+    "ON CONFLICT(user, book, cfi) DO UPDATE SET text = excluded.text"
+  ).bind(me.user, book, cfi, String(b.text || "").slice(0, 120), Date.now()).run();
+  return json({ ok: true });
+}
+
+async function delReadingHighlight(url, env, me) {
+  const book = String(url.searchParams.get("book") || "").slice(0, 60);
+  const cfi = String(url.searchParams.get("cfi") || "").slice(0, 400);
+  if (!book || !cfi) return json({ ok: false, error: "missing" }, 400);
+  await ensureHighlights(env);
+  await env.DB.prepare("DELETE FROM reading_highlights WHERE user = ? AND book = ? AND cfi = ?").bind(me.user, book, cfi).run();
   return json({ ok: true });
 }
 
