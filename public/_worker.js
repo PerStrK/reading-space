@@ -593,6 +593,13 @@ function isSingleWord(t) {
 }
 
 /* 从译文里抠出 /.../ 形式的音标，没有就返回空串 */
+/* 一个真音标不会含中文、不会是长句：曾有免费模型把整句英文拒答
+   “Please provide the JSON template…” 转写成假音标存进库（pointed
+   一案），长度/空格数是最可靠的判别。 */
+function ipaSane(x) {
+  return !!x && !/[\u4e00-\u9fa5]/.test(x) && x.length <= 30 && (x.match(/ /g) || []).length <= 1;
+}
+
 function pickIpa(s) {
   const m = /(?:^|\n)[ \t]*(\/[^\/\n]{1,40}\/)/.exec(String(s || ""));
   return m ? m[1] : "";
@@ -621,7 +628,21 @@ function splitWordText(t) {
 }
 
 /* 模型偶尔会把思考过程写进正文（尤其实时推理类模型），这里做一次兜底清洗 */
-const COT_TELL = /(thinking process|思考过程|analyze the request|output format|draft\s*[:：]|task\s*[:：]|input\s*[:：]|step\s*\d)/i;
+const COT_TELL = /(thinking process|思考过程|analyze the request|output format|draft\s*[:：]|task\s*[:：]|input\s*[:：]|step\s*\d|JSON\s*对象|只输出|需要修正|不要注释|单引号|双引号|part_of_speech|phonetic_en|term_en)/i;
+
+/* 模型有时在答完正文后继续自言自语地纠结输出格式（“…','phonetic_en':…}
+   // 无效？注意 JSON 不能有注释…”），而且这段独白常直接粘在最后一行
+   译文的末尾，按行过滤拦不住。在第一个格式元话语标记处整段截断，
+   再把截断点前残留的引号/括号/斜杠碎渣抹掉；若标记就在开头
+   （整条都是独白），返回空串让上层判定不可用、换模型重试。
+   2026-11-03 实测病例：skinny beak（DeepSeek flash）。 */
+const META_TAIL = /(JSON|json|无效\s*[?？]|需要修正|只输出|不要注释|单引号|双引号|part_of_speech|phonetic|term_en|definitions\s*array|examples\s*array)/;
+function cutMetaTail(s) {
+  const m = META_TAIL.exec(s);
+  if (!m) return s;
+  if (m.index < 12) return "";
+  return s.slice(0, m.index).replace(/['"’\s,，、;；:：}\]）)>/\/]+$/g, "").trim();
+}
 
 function looksLikeThinking(s) {
   return COT_TELL.test(String(s || ""));
@@ -649,6 +670,8 @@ function polishTranslation(raw) {
   let s = stripLabels(String(raw || "").replace(/\r/g, "")).trim();
   if (!s) return "";
   s = s.replace(/```[a-z]*\n?/gi, "").replace(/```/g, "").trim();
+  s = cutMetaTail(s);
+  if (!s) return "";
   if (looksLikeThinking(s)) s = salvageAnswer(s);
   s = s.replace(/\*\*/g, "").replace(/^#{1,6}\s*/gm, "").trim();
   s = s.replace(/^(译文|翻译|中文|答案)\s*[:：]\s*/i, "").trim();
@@ -681,8 +704,8 @@ async function handleTranslate(request, env, me) {
         "SELECT uk_ipa, us_ipa, senses FROM word_store WHERE word = ?"
       ).bind(normWord(text)).first();
       if (ws) {
-        if (ws.uk_ipa) out.uk_ipa = ws.uk_ipa;
-        if (ws.us_ipa) out.us_ipa = ws.us_ipa;
+        if (ws.uk_ipa && ipaSane(ws.uk_ipa)) out.uk_ipa = ws.uk_ipa;
+        if (ws.us_ipa && ipaSane(ws.us_ipa)) out.us_ipa = ws.us_ipa;
         if (ws.senses) {
           try {
             const ss = JSON.parse(ws.senses);
@@ -727,11 +750,30 @@ async function translateCore(env, me, text) {
     try {
       await ensureWordStore(env);
       const ws = await env.DB.prepare(
-        "SELECT def, example, example_zh FROM word_store WHERE word = ?"
+        "SELECT def, example, example_zh, uk_ipa, us_ipa, senses FROM word_store WHERE word = ?"
       ).bind(normWord(text)).first();
       if (ws && ws.def) {
-        const joined = [ws.def, ws.example, ws.example_zh].filter(Boolean).join("\n");
-        return { ok: true, text: joined, ipa: pickIpa(joined), cached: true };
+        let defLine = ws.def;
+        let storeUsable = true;
+        // 单词库的 def 若被模型元话语污染（实测 pointed：整条 def 是
+        // “请提供你希望我使用的 JSON 模板”配了个假音标），有干净的
+        // 结构化义项就用义项重拼一条；没有就当未命中，走后面的链。
+        if (META_TAIL.test(defLine) || /请提供|模板|作为(一|个|AI)/.test(defLine)) {
+          let rebuilt = "";
+          try {
+            const ss = JSON.parse(ws.senses || "[]");
+            if (Array.isArray(ss) && ss.length) {
+              const ipa = [ws.uk_ipa, ws.us_ipa].find((x) => ipaSane(x)) || "";
+              rebuilt = ss.map((s, i) => ((i === 0 && ipa) ? ipa + " " : "") +
+                ((s.pos ? s.pos + " " : "") + (s.zh || "")).trim()).filter(Boolean).join("; ");
+            }
+          } catch (e) {}
+          if (rebuilt) defLine = rebuilt; else storeUsable = false;
+        }
+        if (storeUsable) {
+          const joined = [defLine, ws.example, ws.example_zh].filter(Boolean).join("\n");
+          return { ok: true, text: joined, ipa: pickIpa(joined), cached: true };
+        }
       }
     } catch (e) {}
   }

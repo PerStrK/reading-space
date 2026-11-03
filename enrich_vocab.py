@@ -103,6 +103,13 @@ def openrouter_key():
 KEY = openrouter_key()
 
 
+# 模型元话语/拒答标记：出现即整条作废。实测病例（2026-11-03）：免费小
+# 模型对“按 JSON 模板输出”的提示回了“请提供你希望我使用的 JSON 模板”，
+# 还给这句英文配了假音标，被当成词条 def 存进 word_store（pointed）。
+META_BAD = re.compile(r"JSON|模板|请提供|无效|需要修正|只输出|不要注释|单引号|双引号|"
+                      r"part_of_speech|term_en|phonetic|作为一个|我无法|无法提供")
+
+
 def llm(sys_prompt, user_text, max_tokens=500, need_zh=True, timeout=45, models=None):
     """First usable answer from the model chain, else "".
 
@@ -129,6 +136,8 @@ def llm(sys_prompt, user_text, max_tokens=500, need_zh=True, timeout=45, models=
             got = (((j.get("choices") or [{}])[0].get("message") or {})
                    .get("content") or "").strip()
             got = re.sub(r"```[a-z]*|```", "", got).replace("**", "").strip()
+            if got and META_BAD.search(got):
+                continue
             if got and (not need_zh or re.search(r"[\u4e00-\u9fa5]", got)):
                 return got
         except Exception as ex:
@@ -169,6 +178,9 @@ def llm_structured(model, name, schema, user_text, max_tokens=500, timeout=45):
 def _slash_ipa(v):
     v = (v or "").strip().strip("/")
     v = v.strip("[]: ").strip()
+    # 真音标装不下一整句话；模型曾把整句拒答转写成假音标（pointed）
+    if len(v) > 28 or v.count(" ") > 1:
+        return ""
     return "/" + v + "/" if v else ""
 
 
@@ -438,6 +450,8 @@ def seed_store_full(conn, word, entry):
     if not entry:
         return
     d = compose_def_line(entry)
+    if d and META_BAD.search(d):
+        return
     old = []
     row = conn.execute("SELECT senses FROM word_store WHERE word = ?", (word,)).fetchone()
     if row and row[0]:
