@@ -74,6 +74,10 @@ export default {
     }
 
     if (path === "/api/me") return json({ user: me.user, role: me.role, name: me.name, label: me.label });
+    if (path === "/api/me/password") {
+      if (request.method !== "POST") return json({ ok: false, error: "POST only" }, 405);
+      return changeOwnPassword(request, env, me, secret);
+    }
 
     // ---- 阅读空间：进度与书签 ----
     if (path === "/api/reading/progress") {
@@ -189,14 +193,41 @@ function ver(env) {
   return String(env.AUTH_VER || "1");
 }
 
-async function issueCookie(user, secret, env, location) {
+/* 每账号会话版本号（2026-11-04，配合管理员重置密码）：签名材料里带上
+   它，重置密码时 +1，该账号此前签发的所有 Cookie 立刻失效。列懒建；
+   版本号还是 1 的账号同时接受旧格式签名，升级部署不会把任何人踢下线。 */
+let sessVerColReady = false;
+async function ensureSessVerCol(env) {
+  if (sessVerColReady || !env.DB) return;
+  sessVerColReady = true;
+  try {
+    await env.DB.prepare("ALTER TABLE users ADD COLUMN sess_ver INTEGER DEFAULT 1").run();
+  } catch (e) { /* 列已存在 */ }
+}
+async function getSessVer(env, username) {
+  if (!env.DB) return 1;
+  await ensureSessVerCol(env);
+  try {
+    const r = await env.DB.prepare("SELECT sess_ver FROM users WHERE username = ?").bind(username).first();
+    return (r && Number(r.sess_ver)) || 1;
+  } catch (e) {
+    return 1;
+  }
+}
+
+async function sessionCookieValue(user, secret, env) {
   const exp = Math.floor(Date.now() / 1000) + TTL;
-  const sig = await sign(secret, `${user}|${exp}|${ver(env)}`);
+  const sv = await getSessVer(env, user);
+  const sig = await sign(secret, `${user}|${exp}|${ver(env)}|${sv}`);
+  return `${COOKIE}=${b64url(user)}.${exp}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${TTL}`;
+}
+
+async function issueCookie(user, secret, env, location) {
   return new Response(null, {
     status: 302,
     headers: {
       location,
-      "set-cookie": `${COOKIE}=${b64url(user)}.${exp}.${sig}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${TTL}`,
+      "set-cookie": await sessionCookieValue(user, secret, env),
       "cache-control": "no-store",
     },
   });
@@ -243,9 +274,14 @@ async function session(request, secret, env) {
   } catch (e) {
     return null;
   }
-  const want = await sign(secret, `${user}|${exp}|${ver(env)}`);
-  if (!eq(sig, want)) return null;
-  return resolveIdentity(env, user);
+  const sv = await getSessVer(env, user);
+  const want = await sign(secret, `${user}|${exp}|${ver(env)}|${sv}`);
+  if (eq(sig, want)) return resolveIdentity(env, user);
+  if (sv === 1) {
+    const legacy = await sign(secret, `${user}|${exp}|${ver(env)}`);
+    if (eq(sig, legacy)) return resolveIdentity(env, user);
+  }
+  return null;
 }
 
 async function sign(secret, data) {
@@ -516,6 +552,26 @@ async function delReadingHighlight(url, env, me) {
   await ensureHighlights(env);
   await env.DB.prepare("DELETE FROM reading_highlights WHERE user = ? AND book = ? AND cfi = ?").bind(me.user, book, cfi).run();
   return json({ ok: true });
+}
+
+/* 自助改密码（2026-11-04）：验旧密码 → 换哈希 → 会话版本 +1（其他
+   设备上的旧 Cookie 立刻失效），当前设备回种一枚新 Cookie 不掉线。 */
+async function changeOwnPassword(request, env, me, secret) {
+  let b;
+  try { b = await request.json(); } catch (e) { return json({ ok: false, error: "bad json" }, 400); }
+  const oldPw = String(b.old_password ?? b.old ?? "");
+  const newPw = String(b.new_password ?? b.new ?? "");
+  if (newPw.length < 4 || newPw.length > 64) return json({ ok: false, error: "新密码至少 4 位" }, 400);
+  const row = await getUserRow(env, me.user);
+  if (!row) return json({ ok: false, error: "这个账号由系统配置管理，请联系管理员改密码" }, 400);
+  if (!(await verifyPassword(oldPw, row.pass_hash))) return json({ ok: false, error: "旧密码不对" }, 401);
+  await ensureSessVerCol(env);
+  await env.DB.prepare(
+    "UPDATE users SET pass_hash = ?, sess_ver = COALESCE(sess_ver, 1) + 1 WHERE username = ?"
+  ).bind(await hashPassword(newPw), me.user).run();
+  const headers = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store",
+                    "set-cookie": await sessionCookieValue(me.user, secret, env) };
+  return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
 }
 
 /* ---------- 翻译与生词 ---------- */
@@ -2358,6 +2414,18 @@ async function adminApi(request, url, env, me, path) {
     return json({ ok: true });
   }
 
+  if (path === "/api/admin/users/reset-password" && request.method === "POST") {
+    const u = String(b.username || "");
+    if (!u) return json({ ok: false, error: "missing username" }, 400);
+    const row = await getUserRow(env, u);
+    if (!row) return json({ ok: false, error: "没有这个账号" }, 404);
+    await ensureSessVerCol(env);
+    await env.DB.prepare(
+      "UPDATE users SET pass_hash = ?, sess_ver = COALESCE(sess_ver, 1) + 1 WHERE username = ?"
+    ).bind(await hashPassword("123456"), u).run();
+    return json({ ok: true });
+  }
+
   if (path === "/api/admin/users/restore" && request.method === "POST") {
     const u = String(b.username || "");
     if (!u) return json({ ok: false, error: "missing username" }, 400);
@@ -2425,7 +2493,7 @@ async function adminHtml(env) {
       <td>${when(u.created_at)}</td>
       <td>${u.disabled
         ? `<button data-restore="${esc(u.username)}">恢复</button>`
-        : `<button data-del="${esc(u.username)}">删除</button>`}</td>
+        : `<button data-resetpw="${esc(u.username)}">重置密码</button> <button data-del="${esc(u.username)}">删除</button>`}</td>
     </tr>`).join("");
 
   const bookRows = d.books.map((b) => {
@@ -2549,6 +2617,21 @@ async function adminHtml(env) {
     if (!confirm("删除账号 " + el.dataset.del + "？对方将无法登录（可恢复）。")) return;
     try { await post("/api/admin/users/delete", { username: el.dataset.del }); location.reload(); }
     catch (e) { alert(e.message); }
+  }));
+  document.querySelectorAll("[data-resetpw]").forEach((el) => el.addEventListener("click", async () => {
+    // 两步确认防误触：第一次点把按钮变成「确认重置？」，4 秒内再点才真的执行
+    if (el.dataset.armed !== "1") {
+      el.dataset.armed = "1";
+      el.textContent = "确认重置为 123456？";
+      setTimeout(() => { el.dataset.armed = ""; el.textContent = "重置密码"; }, 4000);
+      return;
+    }
+    el.dataset.armed = "";
+    el.textContent = "重置密码";
+    try {
+      await post("/api/admin/users/reset-password", { username: el.dataset.resetpw });
+      document.getElementById("umsg").textContent = "已把 " + el.dataset.resetpw + " 的密码重置为 123456。对方现在的登录已失效，下次用 123456 登录。";
+    } catch (e) { alert(e.message); }
   }));
   document.querySelectorAll("[data-restore]").forEach((el) => el.addEventListener("click", async () => {
     try { await post("/api/admin/users/restore", { username: el.dataset.restore }); location.reload(); }
