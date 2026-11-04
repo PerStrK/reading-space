@@ -93,7 +93,7 @@ body{font-family:-apple-system,"PingFang SC","Hiragino Sans GB","Microsoft YaHei
   #pop .tr.full{max-height:58vh}
 }
 /* 连续滚动模式：底部翻页键不再有意义 */
-body.scrolled #bot button{opacity:.3; pointer-events:none}
+/* 滚动模式下 ‹ › 是跨章按钮（上一章/下一章），不能禁用——2026-11-04 改 */
 #toast{position:fixed; left:50%; bottom:76px; transform:translateX(-50%); background:rgba(34,38,43,.92);
   color:#fff; font-size:13px; padding:9px 16px; border-radius:999px; opacity:0; transition:opacity .2s; z-index:70; pointer-events:none}
 #toast.on{opacity:1}
@@ -176,7 +176,7 @@ body.night #top .ttl{color:#e6edf3} body.night #top .back,body.night #top .ico,b
 
 <script src="assets/vendor/jszip.min.js"></script>
 <script src="assets/vendor/epub.min.js"></script>
-<script src="assets/reader.js?v=20261031"></script>
+<script src="assets/reader.js?v=20261104"></script>
   <script>if ("serviceWorker" in navigator) { window.addEventListener("load", function () { navigator.serviceWorker.register("/sw.js").catch(function () {}); }); }</script>
 </body>
 </html>

@@ -600,7 +600,11 @@
       width: "100%",
       height: "100%",
       flow: scrolled ? "scrolled" : "paginated",
-      manager: scrolled ? "continuous" : "default",
+      // 滚动模式不用 continuous 管理器：它靠估算章节高度做滚动补偿，
+      // 插图加载后高度变化就会补偿错位——往上滚被反复拉回、到不了书首
+      // （2026-11-04 zhy 报告、已复现）。default 管理器按篇管理、到
+      // 篇首/篇尾自动接相邻篇，位置锚定可靠。
+      manager: "default",
       spread: "none",
       allowScriptedContent: true
     });
@@ -618,6 +622,9 @@
   function markFlowButtons() {
     var a = $("flowPage"), b = $("flowScroll");
     if (!a || !b) return;
+    // 滚动模式下 ‹ › 跨章，分页模式下翻页，标题跟着模式走
+    $("prevBtn").title = FLOW === "scrolled" ? "上一章" : "上一页";
+    $("nextBtn").title = FLOW === "scrolled" ? "下一章" : "下一页";
     var on = "background:#fdf3f1;color:#c2352b;border-color:#f0c9c2";
     var off = "background:none;color:#3a342a;border-color:#e4d9c5";
     a.style.cssText = a.style.cssText.replace(/(background|color|border-color):[^;]*;?/g, "");
