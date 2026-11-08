@@ -29,6 +29,15 @@
 .vhead .exp{margin-left:auto; font-size:13px; color:var(--teal); text-decoration:none; border-bottom:1px solid #bcd8d8; padding-bottom:1px}
 .vhead .exp:hover{color:#c2352b; border-color:#c2352b}
 
+.addbar{display:flex; align-items:center; gap:9px; margin-top:18px; flex-wrap:wrap}
+.addbar input{font:inherit; font-size:14.5px; padding:9px 13px; border:1px solid var(--line); border-radius:10px;
+  background:#fffdf9; color:var(--ink); flex:1 1 220px; min-width:0}
+.addbar input:focus{outline:2px solid #bcd8d8; border-color:var(--teal)}
+.addbar button{font:inherit; font-size:13.5px; font-weight:600; padding:9px 16px; border-radius:10px; cursor:pointer;
+  border:1px solid var(--teal); background:var(--teal); color:#fff}
+.addbar button:disabled{opacity:.55; cursor:default}
+.addbar .addmsg{font-size:13px; color:var(--muted)}
+
 .users{display:flex; flex-wrap:wrap; gap:8px; margin-top:16px}
 .users .ulab{font-size:12.5px; color:var(--muted); align-self:center}
 .users button{font:inherit; font-size:13px; padding:6px 14px; border-radius:999px; cursor:pointer;
@@ -94,6 +103,11 @@
     <a class="exp" id="expMd" href="/api/vocab/export?format=md" hidden>导出 Markdown</a>
   </div>
   <div class="users" id="users" hidden></div>
+  <div class="addbar" id="addbar" hidden>
+    <input id="addInput" type="text" placeholder="输入一个英文单词，直接添加到生词本" autocomplete="off" autocapitalize="none" spellcheck="false">
+    <button id="addBtn">＋ 添加生词</button>
+    <span class="addmsg" id="addMsg"></span>
+  </div>
   <div class="vlist" id="vlist"><div class="loading">正在打开生词本…</div></div>
 </main>
 
@@ -165,6 +179,7 @@ async function load() {
   const own = viewUser === me.user;
   $("whos").textContent = own ? "我的生词本" : "「" + viewUser + "」的生词本";
   $("expMd").hidden = !own;
+  $("addbar").hidden = !own;
   $("vlist").innerHTML = '<div class="loading">正在打开生词本…</div>';
   const q = own ? "" : "?user=" + encodeURIComponent(viewUser);
   let j;
@@ -176,7 +191,7 @@ async function load() {
     ? "共 " + items.length + " 个 · 需复习 " + review.length + " · 已掌握 " + done.length + " · 新收的在最前" : "";
   if (!items.length) {
     $("vlist").innerHTML = '<div class="empty">' +
-      (own ? "还没有生词。<br>在书里划中一个词，点「翻译」或「存生词」，它就会收进这里。"
+      (own ? "还没有生词。<br>可以用上面的输入框直接添加，或在书里划中一个词，点「翻译」或「存生词」收进来。"
            : "这个账号还没有收过生词。") + "</div>";
     return;
   }
@@ -236,13 +251,13 @@ async function load() {
       ((it.senses && it.senses.length)
         ? '<div class="senses">' + it.senses.map(senseBlock).join("") + "</div>"
         : (body ? '<div class="tr">' + esc(body) + "</div>"
-            : '<div class="tr empty">（暂无译文，下次在书里点到它会自动补上）</div>')) +
+            : '<div class="tr empty">（暂无译文，后台会自动补上，稍等几分钟再刷新看看）</div>')) +
       (ctxs || (it.sentence ? '<p class="sent"><b>原句</b>' + esc(it.sentence) + "</p>" : "") +
       (it.sentence_zh ? '<p class="sent"><b>原句翻译</b>' + esc(it.sentence_zh) + "</p>" : "")) +
       (!hasSenseEx && it.example ? '<p class="sent"><b>例句</b>' + esc(it.example) + "</p>" : "") +
       (!hasSenseEx && it.example_zh ? '<p class="sent"><b>例句翻译</b>' + esc(it.example_zh) + "</p>" : "") +
       (it.note ? '<div class="note">备注：' + esc(it.note) + "</div>" : "") +
-      '<div class="meta"><span>📖 ' + esc(it.book_title || it.book) + "</span>" +
+      '<div class="meta"><span>' + (it.book === "manual" ? "✍ 手动添加" : "📖 " + esc(it.book_title || it.book)) + "</span>" +
       (it.first_at ? "<span>加入于 " + fmtDay(it.first_at) + "</span>" : "") +
       (it.hits > 1 ? "<span>划过 " + it.hits + " 次</span>" : "") +
       "</div></article>";
@@ -300,6 +315,29 @@ async function load() {
     });
   }
 }
+
+async function doAdd() {
+  const inp = $("addInput"), btn = $("addBtn"), msg = $("addMsg");
+  const w = inp.value.trim();
+  if (!w) { msg.textContent = "先输入一个单词。"; inp.focus(); return; }
+  btn.disabled = true; msg.textContent = "添加中…";
+  try {
+    const j = await api("/api/vocab", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ word: w, book: "manual", src: "manual" }),
+    });
+    if (j && j.ok) {
+      inp.value = "";
+      msg.textContent = "已添加。词义和例句后台会自动补上。";
+      load();
+    } else {
+      msg.textContent = "没加上" + ((j && j.error) ? "（" + j.error + "）" : "") + "，请重试。";
+    }
+  } catch (e) { msg.textContent = "网络出错，请重试。"; }
+  btn.disabled = false;
+}
+$("addBtn").onclick = doAdd;
+$("addInput").addEventListener("keydown", (e) => { if (e.key === "Enter") doAdd(); });
 
 init();
 </script>

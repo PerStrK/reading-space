@@ -36,7 +36,10 @@ DEV_VARS = HERE / ".dev.vars"
 
 MODELS = ["nvidia/nemotron-3-ultra-550b-a55b:free",
           "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+          "cohere/north-mini-code:free",
+          "openrouter/free",
           "~deepseek/deepseek-flash-latest"]
+DEEPSEEK_MODEL = "~deepseek/deepseek-flash-latest"  # named: MODELS grew at the front in Nov, index [2] no longer means DeepSeek
 
 # Structured Outputs (strict JSON schema): only some models support it
 # (verified 2026-11-03: dots-3-note free, super-vl free and DeepSeek flash
@@ -277,7 +280,7 @@ def translate(conn, text, is_word, timeout=45):
         out = llm(WORD_SYS if is_word else SENT_SYS, text,
                   500 if is_word else 300, timeout=timeout, models=MODELS[:2])
     if not out:
-        out = strict_fn(MODELS[2], text, timeout=timeout)
+        out = strict_fn(DEEPSEEK_MODEL, text, timeout=timeout)
     if not out:
         out = llm(WORD_SYS if is_word else SENT_SYS, text,
                   500 if is_word else 300, timeout=timeout, models=MODELS[2:])
@@ -643,7 +646,7 @@ def main():
             w = r["word"]
             entry = word2_from_structured(STRICT_FREE_MODEL, w, timeout=20) \
                 or word2_from_structured(STRICT_FREE_MODEL2, w, timeout=20) \
-                or word2_from_structured(MODELS[2], w, timeout=20)
+                or word2_from_structured(DEEPSEEK_MODEL, w, timeout=20)
             if entry:
                 seed_store_full(conn, w, entry)
                 done.append(f"senses {w}")
